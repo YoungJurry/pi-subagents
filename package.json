@@ -1,0 +1,50 @@
+{
+  "name": "@youngjurry/pi-subagents-omp",
+  "version": "0.1.0",
+  "description": "Lightweight OMP-inspired subagents for Pi: task/wait, persistent child sessions, native transcript viewer, and message/resume/model switching.",
+  "type": "module",
+  "license": "MIT",
+  "author": "YoungJurry",
+  "keywords": [
+    "pi",
+    "pi-package",
+    "pi-extension",
+    "subagent",
+    "subagents",
+    "omp"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YoungJurry/pi-subagents-omp.git"
+  },
+  "homepage": "https://github.com/YoungJurry/pi-subagents-omp",
+  "bugs": {
+    "url": "https://github.com/YoungJurry/pi-subagents-omp/issues"
+  },
+  "files": [
+    "index.ts",
+    "config.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": ">=1.5.2",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-ai": { "optional": true },
+    "@earendil-works/pi-coding-agent": { "optional": true },
+    "@earendil-works/pi-tui": { "optional": true },
+    "typebox": { "optional": true }
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  }
+}
