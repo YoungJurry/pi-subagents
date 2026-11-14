@@ -1,4 +1,4 @@
-# pi-subagents-omp
+# pi-subagents
 
 Lightweight, OMP-inspired subagents for [Pi](https://pi.dev).
 
@@ -16,7 +16,7 @@ No extra system-prompt section and no per-turn hooks. The extension only uses
 From GitHub:
 
 ```bash
-pi install git:github.com/YoungJurry/pi-subagents-omp
+pi install git:github.com/YoungJurry/pi-subagents
 ```
 
 Or copy this directory to:
@@ -38,7 +38,7 @@ Configuration lives next to `index.ts`:
 For a git install, edit the checkout's `config.json`:
 
 ```text
-~/.pi/agent/git/github.com/YoungJurry/pi-subagents-omp/config.json
+~/.pi/agent/git/github.com/YoungJurry/pi-subagents/config.json
 ```
 
 ```json
