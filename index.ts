@@ -36,7 +36,8 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import { Box, Container, matchesKey, Spacer, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-const CONFIG_PATH = join(dirname(fileURLToPath(import.meta.url)), "config.json");
+const DEFAULT_CONFIG_PATH = join(dirname(fileURLToPath(import.meta.url)), "config.json");
+const USER_CONFIG_PATH = join(getAgentDir(), "subagents.json");
 
 interface ExtensionConfig {
 	maxConcurrent?: number;
@@ -44,12 +45,16 @@ interface ExtensionConfig {
 }
 
 function loadConfig(): ExtensionConfig {
-	try {
-		const parsed = JSON.parse(readFileSync(CONFIG_PATH, "utf8"));
-		return parsed && typeof parsed === "object" ? parsed : {};
-	} catch {
-		return {};
+	let config: ExtensionConfig = {};
+	for (const path of [DEFAULT_CONFIG_PATH, USER_CONFIG_PATH]) {
+		try {
+			const parsed = JSON.parse(readFileSync(path, "utf8"));
+			if (parsed && typeof parsed === "object") config = { ...config, ...parsed };
+		} catch {
+			// Missing or invalid files fall back to the next/default config.
+		}
 	}
+	return config;
 }
 
 const CONFIG = loadConfig();

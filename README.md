@@ -29,16 +29,10 @@ Then run `/reload` or restart Pi.
 
 ## Configuration
 
-Configuration lives next to `index.ts`:
+User configuration lives at:
 
 ```text
-~/.pi/agent/extensions/subagents/config.json
-```
-
-For a git install, edit the checkout's `config.json`:
-
-```text
-~/.pi/agent/git/github.com/YoungJurry/pi-subagents/config.json
+~/.pi/agent/subagents.json
 ```
 
 ```json
@@ -47,6 +41,9 @@ For a git install, edit the checkout's `config.json`:
   "autoCleanOrphans": true
 }
 ```
+
+The repository's `config.json` is only the default. The user file overrides it
+and survives git updates. Partial user configs are merged over the defaults.
 
 - `maxConcurrent`: maximum running child agents. Default `2`; clamped to `1–32`.
   Extra tasks wait in a FIFO queue.
