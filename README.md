@@ -162,7 +162,7 @@ Measured with the current Pi config, `o200k`, and Codex tool serialization:
 
 | Part | Tokens |
 |---|---:|
-| `task` | ~231 |
+| `task` | ~237 |
 | `wait` | ~59 |
 | `agent` | ~159 |
 | System prompt | 0 |
