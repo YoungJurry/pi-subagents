@@ -170,7 +170,7 @@ const BUILTIN_AGENTS: Record<string, AgentDefinition> = {
 };
 
 const TASK_DESCRIPTION =
-	"Delegate independent work to subagents in one batch. Results auto-deliver, so do not poll. agent defaults to task; built-ins are task, scout, review, general; custom agents load from ~/.pi/agent/agents or .pi/agents. Give each task a self-contained assignment; put shared background in context, not in every task.";
+	"Delegate independent work to subagents in one batch. Results auto-deliver, so do not poll. agent defaults to task; use scout or review for read-only work, or a custom agent name. Give each task a self-contained assignment; put shared background in context, not in every task.";
 
 const WAIT_DESCRIPTION = "Wait for the first settled subagent result; use only when blocked.";
 
