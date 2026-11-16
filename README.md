@@ -78,8 +78,11 @@ No environment variables are used. Reload/restart after changing the file.
 - Built-in roles: `task`, `general`, `scout`, `review`; `worker` aliases `task`.
 - Custom agents load from `~/.pi/agent/agents/*.md` and `.pi/agents/*.md`.
 - At most 8 tasks per call.
-- Results auto-deliver after the batch settles. Use `wait` when blocked instead
-  of polling.
+- Completed results auto-deliver in small batches without waiting for unrelated
+  children. Use `wait` when blocked instead of polling.
+- Reports are saved in the parent transcript independently of the best-effort
+  follow-up that wakes the parent. Clearing Pi's message queue cannot discard
+  a report; `wait` can recover a handoff that is not yet acknowledged.
 
 ### `wait`
 
@@ -106,6 +109,8 @@ At least one of `message`, `model`, or `thinking` is required.
 - Finished/saved target: `message` resumes the same session as a follow-up task.
 - Only `model`/`thinking`: switch without starting a new turn.
 - Results still arrive through `wait` or auto-delivery.
+- A stopped child cannot resume until its previous execution has finished
+  cleaning up, so two runs never write to the same transcript concurrently.
 
 This is one compact control tool, not separate `resume` and `send_message`
 tools. It is not OMP's `agent://` / `proc://` URI system.
@@ -183,6 +188,19 @@ Actual totals depend on cwd/date, provider serialization, and other tools.
 - `wait` has no timeout.
 - Viewer live refresh shows persisted messages; streaming partial output is not
   yet integrated.
+
+## Development
+
+```bash
+npm install --legacy-peer-deps
+npm test
+```
+
+Tests use Node's built-in runner and a stubbed Pi API; they do not call models,
+read credentials, or touch normal Pi sessions. TypeScript is a development-only
+compiler dependency. Runtime still uses the same three tools and only the
+`session_start` / `session_shutdown` hooks. A regression test freezes the tool
+schemas and descriptions byte-for-byte.
 
 ## License
 
