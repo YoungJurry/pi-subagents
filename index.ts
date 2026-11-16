@@ -114,6 +114,7 @@ interface TaskRecord {
 }
 
 interface TaskResult {
+	deliveryId: string;
 	id: string;
 	name: string;
 	agent: string;
@@ -236,7 +237,7 @@ function normalizeTools(tools: string[] | undefined): string[] {
 }
 
 function parseFrontmatter(raw: string): { data: Record<string, string>; body: string } {
-	const text = raw.replace(/^\uFEFF/, "").replace(/^\s*\n/, "");
+	const text = raw.replace(/\r\n?/g, "\n").replace(/^\uFEFF/, "").replace(/^\s*\n/, "");
 	const lines = text.split("\n");
 	if (lines[0] !== "---") return { data: {}, body: raw };
 	let end = -1;
@@ -317,7 +318,7 @@ function resolveAgent(agents: Record<string, AgentDefinition>, name: string | un
 	return agent;
 }
 
-function thinkingFor(value: string | undefined): string | undefined {
+function thinkingFor(value: string | undefined): ThinkingLevel | undefined {
 	switch (value) {
 		case "off":
 			return "off";
@@ -389,9 +390,8 @@ function preview(text: string, limit = 5000): string {
 }
 
 function formatResult(result: TaskResult): string {
-	const body = result.error
-		? `<error>${result.error}</error>`
-		: `<output>\n${preview(result.text)}\n</output>`;
+	const body = (result.error ? `<error>${result.error}</error>` : "")
+		+ (result.text || !result.error ? `<output>\n${preview(result.text)}\n</output>` : "");
 	const pointer =
 		result.text.length > 5000 && result.sessionFile
 			? `\n<full-transcript>${result.sessionFile}</full-transcript>`
@@ -708,10 +708,10 @@ class TranscriptViewer {
 		} else if (this.keybindings.matches(data, "tui.select.down")) {
 			this.scrollOffset = Math.min(this.maxScroll(), this.scrollOffset + 1);
 			this.followTail = this.scrollOffset >= this.maxScroll();
-		} else if (this.keybindings.matches(data, "tui.editor.cursorLeft") || matchesKey(data, "pageup")) {
+		} else if (this.keybindings.matches(data, "tui.editor.cursorLeft") || matchesKey(data, "pageUp")) {
 			this.followTail = false;
 			this.scrollOffset = Math.max(0, this.scrollOffset - this.lastBodyHeight);
-		} else if (this.keybindings.matches(data, "tui.editor.cursorRight") || matchesKey(data, "pagedown")) {
+		} else if (this.keybindings.matches(data, "tui.editor.cursorRight") || matchesKey(data, "pageDown")) {
 			this.scrollOffset = Math.min(this.maxScroll(), this.scrollOffset + this.lastBodyHeight);
 			this.followTail = this.scrollOffset >= this.maxScroll();
 		} else if (matchesKey(data, "home")) {
@@ -957,13 +957,15 @@ function persistModelSelection(file: string, cwd: string, modelSpec: string | un
 }
 
 interface Waiter {
-	resolve: (result: TaskResult) => void;
+	resolve: (result: TaskResult | undefined) => void;
 	reject: (error: Error) => void;
 }
 
 class SubagentManager {
 	private tasks = new Map<string, TaskRecord>();
 	private pending: TaskResult[] = [];
+	private sent = new Set<string>();
+	private context?: ExtensionContext;
 	private waiters: Waiter[] = [];
 	private slotWaiters: Array<() => void> = [];
 	private flushTimer?: ReturnType<typeof setTimeout>;
@@ -981,6 +983,8 @@ class SubagentManager {
 
 	setContext(ctx: ExtensionContext): void {
 		this.ui = ctx.ui;
+		this.context = ctx;
+		this.pruneDelivered();
 	}
 
 	private ensureTicker(): void {
@@ -1045,7 +1049,9 @@ class SubagentManager {
 				id,
 				name: input.name?.trim() || id,
 				agent: agentDef.name,
-				task: input.task,
+				task: input.solutionSpace?.trim()
+					? `${input.task}\n\n# Solution space\n${input.solutionSpace.trim()}`
+					: input.task,
 				context,
 				status: "queued",
 				startedAt: Date.now(),
@@ -1054,7 +1060,8 @@ class SubagentManager {
 				thinking:
 					thinkingFor(input.thinking) ??
 					modelEffort(input.model) ??
-					thinkingFor(agentDef.thinking),
+					thinkingFor(agentDef.thinking) ??
+					modelEffort(agentDef.model),
 				agentDef,
 				resolvedModel:
 					input.model ??
@@ -1064,6 +1071,7 @@ class SubagentManager {
 					thinkingFor(input.thinking) ??
 					modelEffort(input.model) ??
 					thinkingFor(agentDef.thinking) ??
+					modelEffort(agentDef.model) ??
 					ctx.thinkingLevel,
 			};
 			this.tasks.set(id, record);
@@ -1082,8 +1090,8 @@ class SubagentManager {
 		thinking?: string,
 	): Promise<TaskRecord> {
 		const active = this.tasks.get(id);
-		if (active && (active.status === "queued" || active.status === "running")) {
-			throw new Error(`Subagent ${id} is still running`);
+		if (active && !active.finished) {
+			throw new Error(`Subagent ${id} is still running or stopping`);
 		}
 		const saved = loadSaved(ctx).find((item) => item.id === id);
 		if (!saved) throw new Error(`Unknown subagent: ${id}`);
@@ -1099,13 +1107,14 @@ class SubagentManager {
 			startedAt: Date.now(),
 			finished: false,
 			modelSpec: modelSpec ?? saved.modelSpec,
-			thinking: thinking ?? saved.thinking ?? modelEffort(saved.modelSpec),
+			thinking: thinking ?? modelEffort(modelSpec) ?? saved.thinking ?? modelEffort(saved.modelSpec),
 			resolvedModel:
 				modelSpec ??
 				saved.modelSpec ??
 				(ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined),
 			resolvedThinking:
 				thinking ??
+				modelEffort(modelSpec) ??
 				saved.thinking ??
 				modelEffort(saved.modelSpec) ??
 				ctx.thinkingLevel,
@@ -1187,7 +1196,7 @@ class SubagentManager {
 			await loader.reload();
 			const modelRuntime = await this.childRuntime(ctx);
 			const model = resolveModel(ctx, record.modelSpec);
-			const thinkingLevel = record.thinking ?? ctx.thinkingLevel;
+			const thinkingLevel = thinkingFor(record.thinking) ?? ctx.thinkingLevel;
 			if (this.closed || record.finished || record.stopRequested) {
 				throw new Error("Stopped by user");
 			}
@@ -1210,7 +1219,11 @@ class SubagentManager {
 			record.resolvedThinking = child.thinkingLevel ?? thinkingLevel;
 			record.sessionFile = child.sessionManager.getSessionFile() ?? record.sessionFile;
 			this.renderWidget();
+			let lastAssistant: any;
 			record.unsubscribe = child.subscribe((event: any) => {
+				if (event?.type === "message_end" && event.message?.role === "assistant") {
+					lastAssistant = event.message;
+				}
 				if (event?.type === "tool_execution_start") {
 					record.activity = event.toolName;
 					record.toolCount = (record.toolCount ?? 0) + 1;
@@ -1231,11 +1244,20 @@ class SubagentManager {
 				: prompt;
 			record.promptStarted = true;
 			await child.prompt(promptWithPending);
-			const last = [...child.messages]
-				.reverse()
-				.find((message: any) => message.role === "assistant" && textOf(message).length > 0);
-			record.result = textOf(last) || "(subagent produced no assistant text)";
-			record.status = record.status === "stopped" ? "stopped" : "completed";
+			// Read this run's events, not old history (whose length can change during compaction).
+			const last = lastAssistant;
+			record.result = textOf(last);
+			if (record.stopRequested || last?.stopReason === "aborted") {
+				record.status = "stopped";
+				record.error ??= last?.errorMessage || "Subagent aborted";
+			} else if (!last || last.stopReason === "error" || last.stopReason === "length" || !record.result) {
+				record.status = "failed";
+				record.error = last?.errorMessage || (last?.stopReason === "length"
+					? "Subagent reached its output limit"
+					: "Subagent produced no assistant text");
+			} else {
+				record.status = "completed";
+			}
 		} catch (error) {
 			record.status = record.status === "stopped" ? "stopped" : "failed";
 			record.error = error instanceof Error ? error.message : String(error);
@@ -1256,11 +1278,11 @@ class SubagentManager {
 			} catch {
 				// Best effort.
 			}
-			if (!record.finalized) {
-				this.release();
-				this.deliver(record);
-				this.renderWidget();
-			}
+			// Capacity belongs to the actual run, not to an early stop notification.
+			this.release();
+			if (!record.finalized) this.deliver(record);
+			this.settleWaiters();
+			this.renderWidget();
 		}
 	}
 
@@ -1285,7 +1307,9 @@ class SubagentManager {
 	private deliver(record: TaskRecord): void {
 		if (this.closed || record.finalized) return;
 		record.finalized = true;
+		this.pruneDelivered();
 		const result: TaskResult = {
+			deliveryId: randomUUID(),
 			id: record.id,
 			name: record.name,
 			agent: record.agent,
@@ -1299,20 +1323,45 @@ class SubagentManager {
 		const waiter = this.waiters.shift();
 		if (waiter) {
 			waiter.resolve(result);
+			this.settleWaiters();
 			return;
 		}
 		this.pending.push(result);
 		this.scheduleFlush();
+		this.settleWaiters();
 	}
 
 	private hasActive(): boolean {
-		return [...this.tasks.values()].some(
-			(record) => record.status === "queued" || record.status === "running",
-		);
+		return [...this.tasks.values()].some((record) => !record.finished);
+	}
+
+	private settleWaiters(): void {
+		if (!this.hasActive()) {
+			for (const waiter of this.waiters.splice(0)) waiter.resolve(undefined);
+		}
+	}
+
+	private pruneDelivered(): void {
+		// A handed-off notification is not an acknowledgement. Keep the mailbox until
+		// the report is actually in the parent transcript, or wait() consumes it.
+		if (this.pending.length === 0) return;
+		const acknowledged = new Set<string>();
+		for (const entry of this.context?.sessionManager.getBranch() ?? []) {
+			if (entry.type !== "custom_message" || entry.customType !== "subagent-result") continue;
+			const details = entry.details as { deliveryId?: string; results?: TaskResult[] } | undefined;
+			for (const result of Array.isArray(details?.results) ? details.results : details ? [details] : []) {
+				if (typeof result?.deliveryId === "string") acknowledged.add(result.deliveryId);
+			}
+		}
+		this.pending = this.pending.filter((result) => {
+			if (!acknowledged.has(result.deliveryId)) return true;
+			this.sent.delete(result.deliveryId);
+			return false;
+		});
 	}
 
 	private scheduleFlush(): void {
-		if (this.closed || this.flushTimer || this.pending.length === 0 || this.hasActive()) return;
+		if (this.closed || this.flushTimer || !this.pending.some((result) => !this.sent.has(result.deliveryId))) return;
 		this.flushTimer = setTimeout(() => {
 			this.flushTimer = undefined;
 			this.flushPending();
@@ -1321,8 +1370,13 @@ class SubagentManager {
 
 	private flushPending(): void {
 		if (this.closed || this.pending.length === 0) return;
-		const results = this.pending.splice(0);
+		this.pruneDelivered();
+		const results = this.pending.filter((result) => !this.sent.has(result.deliveryId));
+		if (results.length === 0) return;
 		try {
+			// Pi persists context-only messages immediately when idle, or at the next
+			// safe turn boundary when busy. Unlike follow-ups, clearQueue() cannot
+			// discard this report. Only the small wake-up message is best-effort.
 			this.pi.sendMessage(
 				{
 					customType: "subagent-result",
@@ -1330,22 +1384,29 @@ class SubagentManager {
 					display: true,
 					details: results.length === 1 ? results[0] : { results },
 				},
+				{ triggerTurn: false },
+			);
+			for (const result of results) this.sent.add(result.deliveryId);
+			this.pi.sendMessage(
+				{ customType: "subagent-ready", content: "Subagent results are available above.", display: false },
 				{ deliverAs: "followUp", triggerTurn: true },
 			);
 		} catch {
-			// The parent session may have been replaced or disposed.
+			// Keep unacknowledged reports recoverable through wait() after a failed send.
 		}
 	}
 
 	async wait(signal?: AbortSignal): Promise<TaskResult | undefined> {
 		if (signal?.aborted) throw new Error("aborted");
+		this.pruneDelivered();
 		if (this.pending.length > 0) {
-			const result = this.pending.shift();
+			const result = this.pending.shift()!;
+			this.sent.delete(result.deliveryId);
 			this.scheduleFlush();
 			return result;
 		}
 		if (!this.hasActive()) return undefined;
-		return await new Promise<TaskResult>((resolve, reject) => {
+		return await new Promise<TaskResult | undefined>((resolve, reject) => {
 			const waiter: Waiter = { resolve, reject };
 			this.waiters.push(waiter);
 			const onAbort = () => {
@@ -1374,7 +1435,7 @@ class SubagentManager {
 		const record = active ?? saved;
 		if (!record) throw new Error(`Unknown subagent: ${id}`);
 		const nextModel = modelSpec ?? record.modelSpec;
-		const nextThinking = thinking ?? record.thinking ?? modelEffort(nextModel);
+		const nextThinking = thinking ?? modelEffort(modelSpec) ?? record.thinking ?? modelEffort(nextModel);
 		if (active?.status === "running" && active.child) {
 			if (model) await active.child.setModel(model);
 			if (nextThinking) active.child.setThinkingLevel(nextThinking);
@@ -1463,20 +1524,14 @@ class SubagentManager {
 
 	private forceFinish(record: TaskRecord): void {
 		if (record.finished || record.finalized) return;
-		record.finished = true;
 		record.endedAt = Date.now();
-		try {
-			record.unsubscribe?.();
-		} catch {
-			// Best effort.
-		}
 		try {
 			record.child?.abort?.();
 			record.child?.dispose?.();
 		} catch {
 			// Best effort.
 		}
-		this.release();
+		// Report the stop, but do not reuse its slot or transcript until run() settles.
 		this.deliver(record);
 		this.renderWidget();
 	}
@@ -1525,6 +1580,7 @@ class SubagentManager {
 			this.flushTimer = undefined;
 		}
 		this.pending.length = 0;
+		this.sent.clear();
 		for (const waiter of this.waiters.splice(0)) waiter.reject(new Error("Session closed"));
 		for (const resolve of this.slotWaiters.splice(0)) resolve();
 		this.active = 0;
@@ -1731,7 +1787,7 @@ export default function (pi: ExtensionAPI) {
 			const labels = records.map((record) => {
 				const model = modelLabel(
 					"resolvedModel" in record ? record.resolvedModel ?? record.modelSpec : record.modelSpec,
-					record.resolvedThinking ?? record.thinking,
+					"resolvedThinking" in record ? record.resolvedThinking ?? record.thinking : record.thinking,
 				);
 				return `${record.id}  ${record.status.padEnd(9)}  ${record.agent.padEnd(8)}  ${record.name}  ${model}`;
 			});
@@ -1742,7 +1798,8 @@ export default function (pi: ExtensionAPI) {
 			if (selected.sessionFile) {
 				await showTranscript(ctx, selected.id, selected);
 			} else {
-				ctx.ui.notify(`${selected.id}: ${selected.status}${selected.error ? ` — ${selected.error}` : ""}`, "info");
+				const error = "error" in selected ? selected.error : undefined;
+				ctx.ui.notify(`${selected.id}: ${selected.status}${error ? ` — ${error}` : ""}`, "info");
 			}
 		},
 	});

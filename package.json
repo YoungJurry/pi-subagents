@@ -54,5 +54,12 @@
   },
   "engines": {
     "node": ">=22.19.0"
+  },
+  "scripts": {
+    "test": "node --experimental-vm-modules --test test/*.test.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "~5.9.3"
   }
 }
