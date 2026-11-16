@@ -29,7 +29,7 @@ async function until(predicate) {
 // Stub the public Pi API, while executing the actual plugin classes/functions.
 async function fixture(t, options = {}) {
     const root = mkdtempSync(join(tmpdir(), "pi-subagents-test-"));
-    writeFileSync(join(root, "subagents.json"), JSON.stringify({ maxConcurrent: options.maxConcurrent ?? 2 }));
+    writeFileSync(join(root, "subagents.json"), JSON.stringify({ maxConcurrent: options.maxConcurrent ?? 2, ...options.config }));
     const sessions = new Map();
     const children = [];
     const behaviors = [];
@@ -70,7 +70,7 @@ async function fixture(t, options = {}) {
             getBranch: () => parentEntries,
         },
         modelRegistry: {
-            find: (provider, id) => ({ provider, id }),
+            find: (provider, id) => options.unavailableModels?.includes(`${provider}/${id}`) ? undefined : ({ provider, id }),
             getRegisteredProviderIds: () => [],
         },
         ui: { setWidget() {}, notify() {} },
@@ -441,6 +441,139 @@ test("empty assistant output is failed, not a success-shaped placeholder", async
     const [record] = await f.start([{ task: "empty answer" }]);
     await until(() => record.finished);
     assert.equal((await f.manager.wait()).status, "failed");
+});
+
+test("global default model is used for every built-in agent when no model is specified", async (t) => {
+    const f = await fixture(t, { config: { defaultModel: "test/flash" } });
+    const records = await f.start(["task", "general", "scout", "review"].map((agent) => ({ task: "report", agent })));
+    await until(() => records.every((record) => record.finished));
+    assert.equal(f.children.length, 4);
+    for (const child of f.children) assert.equal(child.model.id, "flash");
+    for (const record of records) {
+        assert.equal(record.modelSpec, "test/flash");
+        assert.equal(record.resolvedModel, "test/flash");
+    }
+});
+
+test("per-call model beats both the agent-specific and global default models", async (t) => {
+    const f = await fixture(t, { config: { defaultModel: "test/global" } });
+    mkdirSync(join(f.root, "agents"));
+    writeFileSync(join(f.root, "agents", "special.md"), "---\nmodel: test/special\n---\nDo the task.");
+    const [record] = await f.start([{ task: "report", agent: "special", model: "test/explicit" }]);
+    await until(() => record.finished);
+    assert.equal(f.children[0].model.id, "explicit");
+    assert.equal(record.resolvedModel, "test/explicit");
+});
+
+test("agent-specific model beats the global default model", async (t) => {
+    const f = await fixture(t, { config: { defaultModel: "test/global" } });
+    mkdirSync(join(f.root, "agents"));
+    writeFileSync(join(f.root, "agents", "special.md"), "---\nmodel: test/special\n---\nDo the task.");
+    const [record] = await f.start([{ task: "report", agent: "special" }]);
+    await until(() => record.finished);
+    assert.equal(f.children[0].model.id, "special");
+    assert.equal(record.resolvedModel, "test/special");
+});
+
+test("without a default or more specific model the parent's active model is inherited", async (t) => {
+    const f = await fixture(t);
+    const [record] = await f.start([{ task: "report" }]);
+    await until(() => record.finished);
+    assert.equal(f.children[0].model.id, "model");
+    assert.equal(record.resolvedModel, "test/model");
+});
+
+for (const defaultModel of [null, "", "   "]) {
+    test(`an unset default (${JSON.stringify(defaultModel)}) preserves parent inheritance`, async (t) => {
+        const f = await fixture(t, { config: { defaultModel } });
+        const [record] = await f.start([{ task: "report" }]);
+        await until(() => record.finished);
+        assert.equal(f.children[0].model.id, "model");
+    });
+}
+
+test("global default thinking suffix is respected unless explicitly overridden", async (t) => {
+    const f = await fixture(t, { config: { defaultModel: " test/flash:low " } });
+    const records = await f.start([{ task: "low" }, { task: "high", thinking: "high" }]);
+    await until(() => records.every((record) => record.finished));
+    assert.equal(f.children[0].model.id, "flash");
+    assert.equal(f.children[0].thinkingLevel, "low");
+    assert.equal(f.children[1].thinkingLevel, "high");
+    assert.equal(records[0].resolvedThinking, "low");
+});
+
+test("agent-specific thinking takes precedence over the global model's thinking suffix", async (t) => {
+    const f = await fixture(t, { config: { defaultModel: "test/flash:low" } });
+    mkdirSync(join(f.root, "agents"));
+    writeFileSync(join(f.root, "agents", "careful.md"), "---\nthinking: high\n---\nDo the task.");
+    const [record] = await f.start([{ task: "report", agent: "careful" }]);
+    await until(() => record.finished);
+    assert.equal(f.children[0].model.id, "flash");
+    assert.equal(f.children[0].thinkingLevel, "high");
+});
+
+test("an unavailable default fails batch preflight without spawning or falling back", async (t) => {
+    const f = await fixture(t, { config: { defaultModel: "test/missing" }, unavailableModels: ["test/missing"] });
+    await assert.rejects(f.start([{ task: "explicit", model: "test/explicit" }, { task: "default" }]), /Model not available: test\/missing/);
+    assert.equal(f.children.length, 0);
+    assert.equal(f.manager.list().length, 0);
+});
+
+test("malformed configured default is rejected before spawning", async (t) => {
+    const f = await fixture(t, { config: { defaultModel: "no-provider" } });
+    await assert.rejects(f.start([{ task: "report" }]), /Model must be provider\/id/);
+    assert.equal(f.children.length, 0);
+});
+
+test("non-string configured default gives an actionable configuration error", async (t) => {
+    const f = await fixture(t, { config: { defaultModel: 42 } });
+    await assert.rejects(f.start([{ task: "report" }]), /Invalid defaultModel in subagents.json/);
+    assert.equal(f.children.length, 0);
+});
+
+test("an unused invalid default does not block an explicit model", async (t) => {
+    const f = await fixture(t, { config: { defaultModel: 42 } });
+    const [record] = await f.start([{ task: "report", model: "test/explicit" }]);
+    await until(() => record.finished);
+    assert.equal(f.children[0].model.id, "explicit");
+});
+
+test("resuming preserves the saved model rather than replacing it with the global default", async (t) => {
+    const f = await fixture(t, { config: { defaultModel: "test/global" } });
+    const [first] = await f.start([{ task: "first", model: "test/saved" }]);
+    await until(() => first.finished);
+    await f.manager.wait();
+    const second = await f.manager.resume(f.ctx, first.id, "second");
+    await until(() => second.finished);
+    assert.equal(f.children[1].model.id, "saved");
+    const third = await f.manager.resume(f.ctx, first.id, "third", "test/override");
+    await until(() => third.finished);
+    assert.equal(f.children[2].model.id, "override");
+});
+
+test("resuming a legacy child with no saved model uses the global default", async (t) => {
+    const f = await fixture(t, { config: { defaultModel: "test/global:low" } });
+    const [first] = await f.start([{ task: "first" }]);
+    await until(() => first.finished);
+    await f.manager.wait();
+    const entries = readFileSync(first.sessionFile, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    for (const entry of entries) {
+        if (entry.type === "custom" && entry.customType === "omp-subagent") delete entry.data.model;
+    }
+    writeFileSync(first.sessionFile, entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n");
+    const second = await f.manager.resume(f.ctx, first.id, "second");
+    await until(() => second.finished);
+    assert.equal(f.children[1].model.id, "global");
+    assert.equal(f.children[1].thinkingLevel, "low");
+});
+
+test("a global default does not change the parent's model selection", async (t) => {
+    const f = await fixture(t, { config: { defaultModel: "test/flash" } });
+    const parentModel = f.ctx.model;
+    const [record] = await f.start([{ task: "report" }]);
+    await until(() => record.finished);
+    assert.equal(f.ctx.model, parentModel);
+    assert.equal(f.ctx.model.id, "model");
 });
 
 test("custom agent frontmatter supports Windows line endings", async (t) => {

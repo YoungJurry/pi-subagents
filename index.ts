@@ -42,6 +42,7 @@ const USER_CONFIG_PATH = join(getAgentDir(), "subagents.json");
 interface ExtensionConfig {
 	maxConcurrent?: number;
 	autoCleanOrphans?: boolean;
+	defaultModel?: string | null;
 }
 
 function loadConfig(): ExtensionConfig {
@@ -58,6 +59,15 @@ function loadConfig(): ExtensionConfig {
 }
 
 const CONFIG = loadConfig();
+
+function defaultModelSpec(): string | undefined {
+	const spec = CONFIG.defaultModel;
+	if (spec == null) return undefined;
+	if (typeof spec !== "string") {
+		throw new Error("Invalid defaultModel in subagents.json: expected a provider/model-id[:thinking] string or null");
+	}
+	return spec.trim() || undefined;
+}
 
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 type Status = "queued" | "running" | "completed" | "failed" | "stopped";
@@ -1038,12 +1048,12 @@ class SubagentManager {
 		const agents = loadAgents(ctx);
 		const prepared = tasks.map((input) => {
 			const agentDef = resolveAgent(agents, input.agent);
-			const modelSpec = input.model ?? agentDef.model;
+			const modelSpec = input.model ?? agentDef.model ?? defaultModelSpec();
 			if (modelSpec) resolveModel(ctx, modelSpec);
-			return { input, agentDef };
+			return { input, agentDef, modelSpec };
 		});
 		const records: TaskRecord[] = [];
-		for (const { input, agentDef } of prepared) {
+		for (const { input, agentDef, modelSpec } of prepared) {
 			const id = `agent-${randomUUID().slice(0, 8)}`;
 			const record: TaskRecord = {
 				id,
@@ -1056,22 +1066,21 @@ class SubagentManager {
 				status: "queued",
 				startedAt: Date.now(),
 				finished: false,
-				modelSpec: input.model ?? agentDef.model,
+				modelSpec,
 				thinking:
 					thinkingFor(input.thinking) ??
 					modelEffort(input.model) ??
 					thinkingFor(agentDef.thinking) ??
-					modelEffort(agentDef.model),
+					modelEffort(agentDef.model) ??
+					modelEffort(modelSpec),
 				agentDef,
-				resolvedModel:
-					input.model ??
-					agentDef.model ??
-					(ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined),
+				resolvedModel: modelSpec ?? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined),
 				resolvedThinking:
 					thinkingFor(input.thinking) ??
 					modelEffort(input.model) ??
 					thinkingFor(agentDef.thinking) ??
 					modelEffort(agentDef.model) ??
+					modelEffort(modelSpec) ??
 					ctx.thinkingLevel,
 			};
 			this.tasks.set(id, record);
@@ -1095,6 +1104,12 @@ class SubagentManager {
 		}
 		const saved = loadSaved(ctx).find((item) => item.id === id);
 		if (!saved) throw new Error(`Unknown subagent: ${id}`);
+		const agentDef = resolveAgent(loadAgents(ctx), saved.agent);
+		// Preserve a resumed child's saved selection; defaults only fill an unset model.
+		const selectedModel = modelSpec ?? saved.modelSpec ?? agentDef.model ?? defaultModelSpec();
+		if (selectedModel) resolveModel(ctx, selectedModel);
+		const selectedThinking = thinking ?? modelEffort(modelSpec) ?? saved.thinking
+			?? thinkingFor(agentDef.thinking) ?? modelEffort(selectedModel);
 		const dir = sessionDir(ctx);
 		const sessionManager = SessionManager.open(saved.sessionFile, dir, ctx.cwd);
 		const record: TaskRecord = {
@@ -1106,18 +1121,11 @@ class SubagentManager {
 			status: "queued",
 			startedAt: Date.now(),
 			finished: false,
-			modelSpec: modelSpec ?? saved.modelSpec,
-			thinking: thinking ?? modelEffort(modelSpec) ?? saved.thinking ?? modelEffort(saved.modelSpec),
-			resolvedModel:
-				modelSpec ??
-				saved.modelSpec ??
-				(ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined),
-			resolvedThinking:
-				thinking ??
-				modelEffort(modelSpec) ??
-				saved.thinking ??
-				modelEffort(saved.modelSpec) ??
-				ctx.thinkingLevel,
+			modelSpec: selectedModel,
+			thinking: selectedThinking,
+			agentDef,
+			resolvedModel: selectedModel ?? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined),
+			resolvedThinking: selectedThinking ?? ctx.thinkingLevel,
 			sessionFile: saved.sessionFile,
 		};
 		this.tasks.set(id, record);
