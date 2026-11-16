@@ -38,7 +38,8 @@ User configuration lives at:
 ```json
 {
   "maxConcurrent": 2,
-  "autoCleanOrphans": true
+  "autoCleanOrphans": true,
+  "defaultModel": null
 }
 ```
 
@@ -49,6 +50,26 @@ and survives git updates. Partial user configs are merged over the defaults.
   Extra tasks wait in a FIFO queue.
 - `autoCleanOrphans`: remove child-session groups whose recorded parent session
   file no longer exists. Default `true`.
+- `defaultModel`: optional `provider/model-id[:thinking]` selector for children
+  without a more specific model. Omitted, `null`, or blank preserves parent-model
+  inheritance. An invalid/unavailable selected default fails preflight rather
+  than silently falling back to the parent's model.
+
+Model precedence for new children:
+
+```text
+per-call model > agent frontmatter model > defaultModel > parent's active model
+```
+
+For example, set `"defaultModel": "mistral/deepseek-v4-1-flash-1017"` if that
+provider/model is available in your Pi model registry. This is a default, not a
+lock: per-call and agent-specific models still take precedence. It does not
+change the main agent's model. An optional thinking suffix is used only when no
+more specific thinking setting applies; otherwise thinking still inherits.
+
+Resuming an existing child preserves its saved model unless the caller explicitly
+switches it. Legacy children without a saved model use the current agent-specific
+model, then `defaultModel`, then the parent's active model.
 
 No environment variables are used. Reload/restart after changing the file.
 
@@ -121,8 +142,11 @@ tools. It is not OMP's `agent://` / `proc://` URI system.
 - Child cwd is the parent cwd.
 - Child settings inherit the parent working directory and global/project
   settings, including `shellCommandPrefix`.
-- Child model/thinking precedence:
-  per-task `thinking` or `model:thinking` → custom-agent frontmatter → parent.
+- Child model precedence:
+  per-task `model` → custom-agent frontmatter → `defaultModel` → parent.
+- Child thinking precedence:
+  per-task `thinking` or `model:thinking` → custom-agent frontmatter → selected
+  default model's thinking suffix → parent.
 - Child does not inherit parent extensions, project context files, skills, or
   parent prompt instructions.
 - Child tools are role-specific:
@@ -156,6 +180,10 @@ It supports scrolling, paging, jumping to top/bottom, expanding tools, hiding
 thinking, refresh, and Esc to close.
 
 ## TUI
+
+The `/subagents` picker colors statuses using the active Pi theme: running uses
+accent, queued uses warning, completed uses success, failed uses error, stopped
+uses muted, and saved uses dim. Agent ids stay unstyled for reliable selection.
 
 A widget below the editor shows active/queued tasks, elapsed time, resolved
 `provider/model:thinking`, tool count, and the last tool. It is placed
