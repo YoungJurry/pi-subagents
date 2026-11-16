@@ -11,7 +11,7 @@ import vm from "node:vm";
 const source = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
 const js = ts.transpileModule(source, {
     compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
-}).outputText + "\nexport { SubagentManager, parseFrontmatter, formatResult, agentListLabel };\n";
+}).outputText + "\nexport { SubagentManager, TaskTree, loadAgents, resolveAgent, SUBAGENT_PREAMBLE, parseFrontmatter, formatResult, agentListLabel };\n";
 const deferred = () => {
     let resolve;
     const promise = new Promise((done) => { resolve = done; });
@@ -37,7 +37,9 @@ async function fixture(t, options = {}) {
     const durable = [];
     const wakeups = [];
     const hooks = [];
+    const rootHandlers = new Map();
     const tools = [];
+    const commands = new Map();
     const stopTimers = [];
     let sendsFail = false;
     let nextFile = 0;
@@ -46,11 +48,14 @@ async function fixture(t, options = {}) {
             this.file = file;
             this.messages = [];
             this.entries = [];
+            this.id = `child-${nextFile}`;
             mkdirSync(dirname(file), { recursive: true });
-            writeFileSync(file, JSON.stringify({ type: "session", id: "child", timestamp: new Date().toISOString() }) + "\n");
+            writeFileSync(file, JSON.stringify({ type: "session", id: this.id, timestamp: new Date().toISOString() }) + "\n");
             sessions.set(file, this);
         }
         getSessionFile() { return this.file; }
+        getSessionId() { return this.id; }
+        getBranch() { return this.entries; }
         appendCustomEntry(customType, data) {
             const entry = { type: "custom", customType, data };
             this.entries.push(entry);
@@ -62,6 +67,7 @@ async function fixture(t, options = {}) {
     const ctx = {
         cwd: root,
         hasUI: false,
+        isProjectTrusted: () => options.trusted ?? false,
         model: { provider: "test", id: "model" },
         thinkingLevel: "high",
         sessionManager: {
@@ -77,9 +83,9 @@ async function fixture(t, options = {}) {
     };
     writeFileSync(ctx.sessionManager.getSessionFile(), "");
     const pi = {
-        on: (name) => hooks.push(name),
+        on: (name, handler) => { hooks.push(name); rootHandlers.set(name, handler); },
         registerTool: (tool) => tools.push(tool),
-        registerCommand() {},
+        registerCommand(name, command) { commands.set(name, command); },
         sendMessage(message, sendOptions) {
             if (sendsFail) throw new Error("send failed");
             if (sendOptions.triggerTurn === false) durable.push(message);
@@ -89,10 +95,33 @@ async function fixture(t, options = {}) {
     const fakePi = {
         getAgentDir: () => root,
         SessionManager: Session,
-        SettingsManager: { create: () => ({}) },
-        DefaultResourceLoader: class { async reload() {} },
+        SettingsManager: { create: (_cwd, _agentDir, settingsOptions) => ({ settingsOptions }) },
+        createCodemodeExtension: () => () => {},
+        createMcpExtension: () => () => {},
+        createToolSearchExtension: () => () => {},
+        DefaultResourceLoader: class {
+            constructor(options) { this.options = options; this.tools = []; this.hooks = new Map(); }
+            async reload() {
+                const extension = { tools: new Map() };
+                const api = {
+                    ...pi,
+                    on: (name, handler) => this.hooks.set(name, handler),
+                    registerTool: (tool) => { this.tools.push(tool); extension.tools.set(tool.name, { definition: tool }); },
+                    registerCommand() {},
+                    sendMessage: (message, sendOptions) => {
+                        this.child.reports.push(message);
+                        this.child.sessionManager.entries.push({ type: "custom_message", ...message });
+                        if (sendOptions.triggerTurn) this.child.backgroundTurns++;
+                    },
+                };
+                for (const input of this.options.extensionFactories ?? []) input.factory?.(api);
+                const discovered = { path: "installed-subagents", tools: new Map([["task", { definition: tools[0] }]]) };
+                const web = { path: "web-tools", tools: new Map(["web_search", "fetch", "codemode"].map((name) => [name, { definition: { name } }])) };
+                this.loaded = this.options.extensionsOverride?.({ extensions: [discovered, web, extension], errors: [], runtime: {} });
+            }
+        },
         ModelRuntime: { create: async () => ({}) },
-        createAgentSession: async ({ sessionManager, model, thinkingLevel }) => {
+        createAgentSession: async ({ sessionManager, model, thinkingLevel, resourceLoader, tools: selectedTools }) => {
             const behavior = behaviors.shift() ?? {};
             const listeners = new Set();
             const child = {
@@ -100,9 +129,21 @@ async function fixture(t, options = {}) {
                 model,
                 thinkingLevel,
                 sessionManager,
-                getAllTools: () => [],
+                resourceOptions: resourceLoader.options,
+                selectedTools,
+                reports: [],
+                backgroundTurns: 0,
+                turns: 0,
+                extensionRunner: { emit: async (event) => resourceLoader.hooks.get(event.type)?.(event, child.ctx) },
+                callTool: async (name, params, signal) => {
+                    const tool = resourceLoader.tools.find((item) => item.name === name);
+                    assert.ok(tool, `missing child tool: ${name}`);
+                    return tool.execute("child-call", params, signal, undefined, child.ctx);
+                },
+                getAllTools: () => (resourceLoader.loaded?.extensions ?? []).flatMap((extension) => [...extension.tools.values()].map((tool) => tool.definition)),
+                getToolDefinition: (name) => (resourceLoader.loaded?.extensions ?? []).flatMap((extension) => [...extension.tools.values()]).find((tool) => tool.definition.name === name)?.definition,
                 subscribe: (listener) => { listeners.add(listener); return () => listeners.delete(listener); },
-                bindExtensions: async () => {},
+                bindExtensions: async () => resourceLoader.hooks.get("session_start")?.({ type: "session_start" }, child.ctx),
                 dispose() { this.disposed = true; },
                 abort() { this.aborted = true; },
                 async setModel(next) { this.model = next; },
@@ -110,7 +151,9 @@ async function fixture(t, options = {}) {
                 async steer(text) { this.steered = text; },
                 async prompt(text) {
                     this.promptText = text;
+                    this.turns++;
                     this.messages.push({ role: "user", content: text });
+                    if (behavior.run) await behavior.run(this, text);
                     if (behavior.gate) await behavior.gate.promise;
                     if (behavior.throw) throw new Error(behavior.throw);
                     if (behavior.noResponse) return;
@@ -119,12 +162,14 @@ async function fixture(t, options = {}) {
                         role: "assistant",
                         stopReason: behavior.stopReason ?? "stop",
                         errorMessage: behavior.error,
-                        content: [{ type: "text", text: behavior.text ?? "answer" }],
+                        content: [{ type: "text", text: typeof behavior.text === "function" ? behavior.text(this) : behavior.text ?? "answer" }],
                     };
                     this.messages.push(message);
                     for (const listener of listeners) listener({ type: "message_end", message });
                 },
             };
+            child.ctx = { ...ctx, sessionManager, model, thinkingLevel, ui: { setWidget() {}, notify() {} } };
+            resourceLoader.child = child;
             children.push(child);
             return { session: child };
         },
@@ -172,11 +217,12 @@ async function fixture(t, options = {}) {
     manager.setContext(ctx);
     t.after(() => {
         manager.shutdown();
+        rootHandlers.get("session_shutdown")?.();
         for (const behavior of behaviors) behavior.gate?.resolve();
         rmSync(root, { recursive: true, force: true });
     });
     return {
-        root, manager, ctx, children, behaviors, durable, wakeups, hooks, tools, stopTimers,
+        root, manager, ctx, children, behaviors, durable, wakeups, hooks, tools, commands, stopTimers,
         exports: module.namespace,
         failSends() { sendsFail = true; },
         clearQueue() { wakeups.length = 0; },
@@ -443,11 +489,11 @@ test("empty assistant output is failed, not a success-shaped placeholder", async
     assert.equal((await f.manager.wait()).status, "failed");
 });
 
-test("global default model is used for every built-in agent when no model is specified", async (t) => {
+test("global default model is used for built-in roles and legacy aliases", async (t) => {
     const f = await fixture(t, { config: { defaultModel: "test/flash" } });
-    const records = await f.start(["task", "general", "scout", "review"].map((agent) => ({ task: "report", agent })));
+    const records = await f.start(["task", "scout", "review", "general", "worker"].map((agent) => ({ task: "report", agent })));
     await until(() => records.every((record) => record.finished));
-    assert.equal(f.children.length, 4);
+    assert.equal(f.children.length, 5);
     for (const child of f.children) assert.equal(child.model.id, "flash");
     for (const record of records) {
         assert.equal(record.modelSpec, "test/flash");
@@ -599,6 +645,288 @@ test("colored labels keep the resolved runtime model and saved-session fallback"
     assert.ok(f.exports.agentListLabel(live, theme).endsWith("test/new:high"));
     const saved = { id: "agent-saved", agent: "scout", name: "saved", status: "saved" };
     assert.ok(f.exports.agentListLabel(saved, theme).endsWith("inherit:inherit"));
+});
+
+test("only three built-in roles remain; general and worker are compatibility aliases", async (t) => {
+    const f = await fixture(t);
+    const agents = f.exports.loadAgents(f.ctx);
+    assert.deepEqual(Object.keys(agents).sort(), ["review", "scout", "task"]);
+    for (const name of [undefined, "task", "general", "worker"]) {
+        assert.equal(f.exports.resolveAgent(agents, name).name, "task");
+    }
+});
+
+test("approved role prompts use only the single shared introduction", async (t) => {
+    const f = await fixture(t);
+    const intro = "你是受主 Agent 委派的子 Agent。根据收到的任务工作。";
+    const agents = f.exports.loadAgents(f.ctx);
+    assert.equal(f.exports.SUBAGENT_PREAMBLE, intro);
+    assert.ok(agents.task.prompt.includes("你是一名专注的通用执行者，负责完成明确委派的任务。"));
+    for (const [name, role] of Object.entries(agents)) {
+        assert.equal(role.prompt.split("\n\n")[0], intro);
+        assert.equal(role.prompt.split(intro).length, 2);
+        assert.equal(role.tools, undefined);
+        assert.equal(role.prompt.split("\n- ").length - 1, name === "scout" ? 4 : 5);
+    }
+    assert.match(agents.scout.prompt, /委派的任务也必须保持只读/);
+    assert.match(agents.review.prompt, /缺少测试不等于存在功能错误/);
+});
+
+test("all roles load configured extensions and builtins without a tool allowlist", async (t) => {
+    const f = await fixture(t, { trusted: false });
+    const records = await f.start(["task", "scout", "review"].map((agent) => ({ agent, task: "inspect" })));
+    await until(() => records.every((record) => record.finished));
+    for (const child of f.children) {
+        assert.equal(child.selectedTools, undefined);
+        assert.equal(child.resourceOptions.noExtensions, undefined);
+        assert.equal(child.resourceOptions.settingsManager.settingsOptions.projectTrusted, false);
+        assert.deepEqual(Array.from(child.resourceOptions.extensionFactories.filter((input) => input.builtin).map((input) => input.name)), ["codemode", "tool-search", "mcp"]);
+        assert.ok(child.resourceOptions.systemPrompt.startsWith(f.exports.SUBAGENT_PREAMBLE));
+        assert.ok(child.promptText.includes("shared context\n\n# Assignment\ninspect"));
+        for (const name of ["web_search", "fetch", "codemode", "task", "wait", "agent"]) {
+            assert.equal(child.getAllTools().filter((tool) => tool.name === name).length, 1);
+        }
+    }
+});
+
+test("custom general overrides the legacy alias and retains its own prompt and tool selection", async (t) => {
+    const f = await fixture(t);
+    mkdirSync(join(f.root, "agents"));
+    writeFileSync(join(f.root, "agents", "general.md"), "---\ntools: read, web_search, fetch\n---\nMy custom instructions.");
+    const [record] = await f.start([{ agent: "general", task: "inspect" }]);
+    await until(() => record.finished);
+    assert.equal(record.agent, "general");
+    assert.equal(f.children[0].resourceOptions.systemPrompt, "My custom instructions.");
+    assert.deepEqual(Array.from(f.children[0].selectedTools), ["read", "web_search", "fetch"]);
+});
+
+test("a legacy saved general child resumes through the task compatibility alias", async (t) => {
+    const f = await fixture(t);
+    const [first] = await f.start([{ task: "first" }]);
+    await until(() => first.finished);
+    await f.manager.wait();
+    const entries = readFileSync(first.sessionFile, "utf8").trim().split("\n").map(JSON.parse);
+    for (const entry of entries) if (entry.customType === "omp-subagent") entry.data.agent = "general";
+    writeFileSync(first.sessionFile, entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n");
+    const resumed = await f.manager.resume(f.ctx, first.id, "continue");
+    await until(() => resumed.finished);
+    assert.equal(resumed.status, "completed");
+    assert.equal(f.children[1].resourceOptions.systemPrompt, f.exports.loadAgents(f.ctx).task.prompt);
+});
+
+test("nested waits lend slots and permit more than two levels with a budget of one", async (t) => {
+    const f = await fixture(t, { maxConcurrent: 1, config: { defaultModel: "test/flash:high" } });
+    const results = [];
+    for (let level = 1; level <= 5; level++) {
+        f.behaviors.push({
+            text: `level-${level}`,
+            async run(child) {
+                assert.ok(f.manager.tree.active <= 1);
+                if (level === 5) return;
+                await child.callTool("task", { context: "nested", tasks: [{ task: `level ${level + 1}` }] });
+                const response = await child.callTool("wait", {});
+                results.push(response);
+            },
+        });
+    }
+    const [record] = await f.start([{ task: "level 1" }]);
+    await until(() => record.finished);
+    assert.equal(record.status, "completed", record.error);
+    assert.equal(f.children.length, 5);
+    assert.equal(results.length, 4);
+    assert.equal(f.manager.tree.active, 0);
+    assert.equal(f.manager.tree.queue.length, 0);
+    for (const child of f.children) {
+        assert.equal(child.model.id, "flash");
+        assert.equal(child.thinkingLevel, "high");
+        assert.equal(child.backgroundTurns, 0);
+        assert.equal(child.disposed, true);
+    }
+});
+
+test("parallel nested waits do not reclaim the parent's sole slot before all waits settle", async (t) => {
+    const f = await fixture(t, { maxConcurrent: 1 });
+    f.behaviors.push({ async run(child) {
+        await child.callTool("task", { context: "nested", tasks: [{ task: "leaf A" }, { task: "leaf B" }] });
+        const results = await Promise.all([child.callTool("wait", {}), child.callTool("wait", {})]);
+        assert.equal(results.length, 2);
+    } }, { text: "A" }, { text: "B" });
+    const [record] = await f.start([{ task: "parent" }]);
+    await until(() => record.finished);
+    assert.equal(record.status, "completed", record.error);
+    assert.equal(f.children.length, 3);
+    assert.equal(f.manager.tree.active, 0);
+});
+
+test("idle delegating agents are kept alive and receive descendant results before completing", async (t) => {
+    const f = await fixture(t, { maxConcurrent: 1 });
+    f.behaviors.push({
+        text: (child) => child.turns === 1 ? "waiting" : "final parent answer",
+        async run(child) {
+            if (child.turns === 1) await child.callTool("task", { context: "nested", tasks: [{ task: "leaf" }] });
+            else assert.equal(child.reports[0].details.text, "leaf answer");
+        },
+    }, { text: "leaf answer" });
+    const [record] = await f.start([{ task: "parent" }]);
+    await until(() => record.finished);
+    assert.equal(record.status, "completed", record.error);
+    assert.equal(record.result, "final parent answer");
+    assert.equal(f.children[0].turns, 2);
+    assert.equal(f.children[0].backgroundTurns, 0);
+    assert.equal((await f.manager.wait()).text, "final parent answer");
+    assert.equal(await f.manager.wait(), undefined);
+});
+
+test("siblings share the same tree budget instead of multiplying concurrency", async (t) => {
+    const f = await fixture(t, { maxConcurrent: 2 });
+    let leaves = 0;
+    const parent = {
+        async run(child) {
+            if (child.turns !== 1) return;
+            for (let n = 0; n < 2; n++) f.behaviors.push({ async run() {
+                leaves++;
+                assert.ok(f.manager.tree.active <= 2);
+                await delay(5);
+            } });
+            await child.callTool("task", { context: "nested", tasks: [{ task: "leaf A" }, { task: "leaf B" }] });
+            await child.callTool("wait", {});
+            await child.callTool("wait", {});
+        },
+    };
+    f.behaviors.push(parent, parent);
+    const records = await f.start([{ task: "parent A" }, { task: "parent B" }]);
+    await until(() => records.every((record) => record.finished));
+    assert.equal(leaves, 4);
+    assert.ok(records.every((record) => record.status === "completed"));
+    assert.equal(f.manager.tree.active, 0);
+});
+
+test("stopping an ancestor aborts its descendants and waits for their cleanup", async (t) => {
+    const f = await fixture(t, { maxConcurrent: 1 });
+    const gate = deferred();
+    f.behaviors.push({ async run(child) {
+        await child.callTool("task", { context: "nested", tasks: [{ task: "blocked leaf" }] });
+        await child.callTool("wait", {});
+    } }, { gate });
+    const [record] = await f.start([{ task: "parent" }]);
+    await until(() => f.children.length === 2 && f.children[1].promptText);
+    f.manager.stop(record.id);
+    await until(() => f.children[1].aborted);
+    assert.equal(record.finished, false);
+    await assert.rejects(f.manager.resume(f.ctx, record.id, "too early"), /still running or stopping/);
+    gate.resolve();
+    await until(() => record.finished);
+    assert.equal(record.status, "stopped");
+    assert.equal(f.manager.tree.active, 0);
+    assert.equal(f.children[1].disposed, true);
+});
+
+test("tree rows retain parent-child structure both live and after restoring saved sessions", async (t) => {
+    const f = await fixture(t, { maxConcurrent: 1 });
+    f.behaviors.push({ async run(child) {
+        if (child.turns === 1) await child.callTool("task", { context: "nested", tasks: [{ task: "nested scout", agent: "scout" }] });
+    } }, { text: "scout findings" });
+    const [record] = await f.start([{ task: "parent" }]);
+    await until(() => record.finished);
+    const live = f.manager.treeRows(f.ctx);
+    assert.equal(live.length, 2);
+    assert.equal(live[0].record.id, record.id);
+    assert.equal(live[0].prefix, "");
+    assert.equal(live[1].record.agent, "scout");
+    assert.equal(live[1].prefix, "└─ ");
+    const restored = new f.exports.SubagentManager({ sendMessage() {} });
+    const saved = restored.treeRows(f.ctx);
+    assert.equal(saved.length, 2);
+    assert.equal(saved[0].record.id, record.id);
+    assert.equal(saved[1].prefix, "└─ ");
+    assert.equal(saved[1].record.status, "saved");
+    restored.shutdown();
+});
+
+test("picker selection still works on indented and colored descendant labels", async (t) => {
+    const f = await fixture(t, { maxConcurrent: 1 });
+    const notices = [];
+    f.ctx.ui.theme = { fg(_color, text) { return text ? `\u001b[36m${text}\u001b[39m` : ""; } };
+    f.ctx.ui.notify = (text) => notices.push(text);
+    f.behaviors.push({ async run(child) {
+        if (child.turns === 1) await child.callTool("task", { context: "nested", tasks: [{ task: "nested", agent: "scout" }] });
+    } }, {});
+    const task = f.tools.find((tool) => tool.name === "task");
+    await task.execute("root-call", { context: "shared", tasks: [{ task: "parent" }] }, undefined, undefined, f.ctx);
+    await until(() => f.children.length === 2 && f.children.every((child) => child.disposed));
+    f.ctx.ui.select = async (_title, labels) => {
+        assert.equal(labels.length, 2);
+        assert.ok(labels[1].includes("└─ "));
+        assert.ok(labels[1].includes("scout"));
+        return labels[1];
+    };
+    await f.commands.get("subagents").handler("", f.ctx);
+    assert.equal(notices.length, 1);
+});
+
+for (const stopReason of ["aborted", "error", "length"]) {
+    test(`a parent ending with ${stopReason} cancels descendants instead of pumping another turn`, async (t) => {
+        const f = await fixture(t, { maxConcurrent: 1 });
+        f.behaviors.push({ stopReason, async run(child) {
+            await child.callTool("task", { context: "nested", tasks: [{ task: "must not start" }] });
+        } });
+        const [record] = await f.start([{ task: "parent" }]);
+        await until(() => record.finished);
+        assert.equal(record.status, stopReason === "aborted" ? "stopped" : "failed");
+        assert.equal(f.children.length, 1);
+        assert.equal(f.children[0].turns, 1);
+        assert.equal(f.manager.tree.active, 0);
+        assert.equal(f.manager.tree.queue.length, 0);
+    });
+}
+
+test("an aborted nested wait does not block cleanup trying to reacquire a busy slot", async (t) => {
+    const f = await fixture(t, { maxConcurrent: 1 });
+    const gate = deferred();
+    const controller = new AbortController();
+    f.behaviors.push({ async run(child) {
+        await child.callTool("task", { context: "nested", tasks: [{ task: "blocked leaf" }] });
+        await child.callTool("wait", {}, controller.signal);
+    } }, { gate });
+    const [record] = await f.start([{ task: "parent" }]);
+    await until(() => f.children.length === 2 && f.children[1].promptText);
+    controller.abort();
+    await until(() => f.children[1].aborted);
+    gate.resolve();
+    await until(() => record.finished);
+    assert.equal(f.manager.tree.active, 0);
+    assert.equal(f.manager.tree.queue.length, 0);
+});
+
+test("saved tree rendering ignores cyclic session ids", async (t) => {
+    const f = await fixture(t);
+    const [record] = await f.start([{ task: "parent" }]);
+    await until(() => record.finished);
+    const entries = readFileSync(record.sessionFile, "utf8").trim().split("\n").map(JSON.parse);
+    entries[0].id = "parent";
+    writeFileSync(record.sessionFile, entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n");
+    const restored = new f.exports.SubagentManager({ sendMessage() {} });
+    assert.equal(restored.treeRows(f.ctx).length, 1);
+    restored.shutdown();
+});
+
+test("active widget renders the same descendant tree rather than independent rows", async (t) => {
+    const f = await fixture(t, { maxConcurrent: 1 });
+    const gate = deferred();
+    let latest;
+    f.ctx.ui.setWidget = (_name, content) => { if (content) latest = content; };
+    f.behaviors.push({ async run(child) {
+        await child.callTool("task", { context: "nested", tasks: [{ task: "nested", agent: "scout" }] });
+        await child.callTool("wait", {});
+    } }, { gate });
+    const [record] = await f.start([{ task: "parent" }]);
+    await until(() => f.children.length === 2 && f.children[1].promptText);
+    assert.ok(latest.some((line) => line.startsWith("└─ ") && line.includes("scout")));
+    const descendant = f.manager.treeRows(f.ctx)[1].record;
+    assert.equal((await f.manager.getAny(f.ctx, descendant.id)).id, descendant.id);
+    assert.equal(f.manager.stop(descendant.id).status, "stopped");
+    gate.resolve();
+    await until(() => record.finished);
 });
 
 test("custom agent frontmatter supports Windows line endings", async (t) => {

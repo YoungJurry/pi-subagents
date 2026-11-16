@@ -20,6 +20,9 @@ import {
 	BranchSummaryMessageComponent,
 	CompactionSummaryMessageComponent,
 	createAgentSession,
+	createCodemodeExtension,
+	createMcpExtension,
+	createToolSearchExtension,
 	CustomMessageComponent,
 	DefaultResourceLoader,
 	getAgentDir,
@@ -75,7 +78,7 @@ type Status = "queued" | "running" | "completed" | "failed" | "stopped";
 interface AgentDefinition {
 	name: string;
 	description?: string;
-	tools: string[];
+	tools?: string[];
 	prompt: string;
 	model?: string;
 	thinking?: string;
@@ -121,6 +124,11 @@ interface TaskRecord {
 	toolDefinitions?: Map<string, any>;
 	pendingMessages?: string[];
 	promptStarted?: boolean;
+	sessionId?: string;
+	descendants?: SubagentManager;
+	slotHeld?: boolean;
+	runPromise?: Promise<void>;
+	cleanupPromise?: Promise<void>;
 }
 
 interface TaskResult {
@@ -147,36 +155,49 @@ interface SavedTask {
 	createdAt: number;
 	status: "saved";
 	parentSessionFile?: string | null;
+	sessionId?: string;
 }
+
+const SUBAGENT_PREAMBLE = "你是受主 Agent 委派的子 Agent。根据收到的任务工作。";
 
 const BUILTIN_AGENTS: Record<string, AgentDefinition> = {
 	task: {
 		name: "task",
-		description: "General coding worker",
-		tools: ["read", "bash", "edit", "write"],
-		prompt:
-			"You are a focused coding worker. Complete only the assigned task. Inspect before editing, preserve unrelated work, verify with focused checks, and return a concise result. Do not delegate further.",
-	},
-	general: {
-		name: "general",
-		description: "General worker with the same tools as task",
-		tools: ["read", "bash", "edit", "write"],
-		prompt:
-			"You are a focused general worker. Complete only the assigned task. Inspect before editing, preserve unrelated work, verify with focused checks, and return a concise result. Do not delegate further.",
+		description: "General-purpose worker",
+		prompt: `${SUBAGENT_PREAMBLE}
+
+你是一名专注的通用执行者，负责完成明确委派的任务。
+
+- 行动前检查相关事实与环境；修改前确认现有内容及已有改动。
+- 采用必要且最小的变更，不覆盖或回退与任务无关的工作。
+- 不执行未经授权的破坏性操作；需要额外授权时交由主 Agent 处理。
+- 临时脚本、备份和中间文件放在 /tmp；正式产物放在指定位置。
+- 执行与任务相称的验证；汇报结果、重要改动和验证情况，说明无法验证的部分。`,
 	},
 	scout: {
 		name: "scout",
 		description: "Read-only investigation",
-		tools: ["read", "bash"],
-		prompt:
-			"You are a read-only investigator. Use read and bash only to inspect; never modify files or run state-changing commands. Return concise findings with file paths and line references.",
+		prompt: `${SUBAGENT_PREAMBLE}
+
+你是一名只读调查员，负责查明事实、定位信息并提供证据。
+
+- 优先搜索和定点阅读，按任务需要追踪相关调用、配置或依赖，避免无目的地遍历和读取。
+- 搜索为空时尝试其他关键词、路径或入口，不凭一次空结果认定目标不存在。
+- 严格只读：不修改文件，不执行可能改变工作区或系统状态的命令；委派的任务也必须保持只读。
+- 交付主要发现、证据位置和必要的关系说明；发现需要修改或有副作用的验证时，报告给主 Agent，不自行执行。`,
 	},
 	review: {
 		name: "review",
-		description: "Read-only code review",
-		tools: ["read", "bash"],
-		prompt:
-			"You are a read-only code reviewer. Inspect the assignment and report concrete bugs, risks, and missing tests with file and line references. Do not modify files.",
+		description: "Read-only review",
+		prompt: `${SUBAGENT_PREAMBLE}
+
+你是一名只读审查员，负责识别指定代码、配置、方案或改动中的具体问题。
+
+- 根据预期行为和约束审查，必要时追踪相关上下文及已有测试，不凭局部片段下结论。
+- 优先报告影响正确性、安全性和兼容性的问题，不以风格偏好或无依据的猜测充当缺陷。
+- 区分确认缺陷、条件性风险和验证缺口；缺少测试不等于存在功能错误。
+- 严格只读，不修改文件，不执行可能改变工作区或系统状态的验证命令；委派的任务也必须保持只读。
+- 按重要程度报告问题，说明位置、触发条件、影响和依据；没有明确发现时如实说明，并交代审查局限。`,
 	},
 };
 
@@ -233,17 +254,9 @@ function parseList(value: string | undefined): string[] | undefined {
 	return items.length > 0 ? items : undefined;
 }
 
-function normalizeTools(tools: string[] | undefined): string[] {
-	const out = new Set<string>();
-	for (const tool of tools ?? []) {
-		if (PI_TOOLS.has(tool)) out.add(tool);
-		else if (BASH_ALIASES.has(tool)) out.add("bash");
-	}
-	if (out.size > 0) {
-		if (out.has("bash")) out.add("read");
-		return [...out];
-	}
-	return tools && tools.length > 0 ? ["read", "bash"] : ["read", "bash", "edit", "write"];
+function normalizeTools(tools: string[] | undefined): string[] | undefined {
+	if (!tools) return undefined;
+	return [...new Set(tools.map((tool) => BASH_ALIASES.has(tool) ? "bash" : tool))];
 }
 
 function parseFrontmatter(raw: string): { data: Record<string, string>; body: string } {
@@ -321,7 +334,7 @@ function loadAgents(ctx: ExtensionContext): Record<string, AgentDefinition> {
 
 function resolveAgent(agents: Record<string, AgentDefinition>, name: string | undefined): AgentDefinition {
 	const key = name?.trim() || "task";
-	const agent = agents[key] ?? (key === "worker" ? agents.task : undefined);
+	const agent = agents[key] ?? (key === "worker" || key === "general" ? agents.task : undefined);
 	if (!agent) {
 		throw new Error(`Unknown agent: ${key}. Available: ${Object.keys(agents).sort().join(", ")}`);
 	}
@@ -852,8 +865,8 @@ function readHead(file: string, bytes = 65536): string {
 	}
 }
 
-function loadSaved(ctx: ExtensionContext): SavedTask[] {
-	const dir = sessionDir(ctx);
+function loadSaved(ctx: ExtensionContext, parentSessionId = ctx.sessionManager.getSessionId()): SavedTask[] {
+	const dir = join(getAgentDir(), "subagents", parentSessionId);
 	if (!existsSync(dir)) return [];
 	const saved: SavedTask[] = [];
 	let files: string[];
@@ -908,6 +921,7 @@ function loadSaved(ctx: ExtensionContext): SavedTask[] {
 			createdAt: Number(meta.createdAt ?? Date.parse(header?.timestamp ?? "")) || 0,
 			status: "saved",
 			parentSessionFile: meta.parentSessionFile ?? null,
+			sessionId: header?.id,
 		});
 	}
 	return saved.sort((a, b) => b.createdAt - a.createdAt);
@@ -982,25 +996,79 @@ interface Waiter {
 	reject: (error: Error) => void;
 }
 
+// One scheduler is passed through the tree; waiting parents lend their slot to descendants.
+class TaskTree {
+	private active = 0;
+	private queue: Array<{ record: TaskRecord; resolve: (acquired: boolean) => void }> = [];
+	onChange?: () => void;
+	private readonly limit = (() => {
+		const raw = Number(CONFIG.maxConcurrent ?? 2);
+		return Number.isFinite(raw) ? Math.max(1, Math.min(32, Math.floor(raw))) : 2;
+	})();
+
+	async acquire(record: TaskRecord): Promise<boolean> {
+		if (record.finished || record.stopRequested) return false;
+		if (record.slotHeld) return true;
+		if (this.active < this.limit) {
+			this.active++;
+			record.slotHeld = true;
+			return true;
+		}
+		return new Promise((resolve) => this.queue.push({ record, resolve }));
+	}
+
+	release(record: TaskRecord): void {
+		if (!record.slotHeld) return;
+		record.slotHeld = false;
+		this.active--;
+		while (this.queue.length > 0 && this.active < this.limit) {
+			const next = this.queue.shift()!;
+			if (next.record.finished || next.record.stopRequested) {
+				next.resolve(false);
+				continue;
+			}
+			this.active++;
+			next.record.slotHeld = true;
+			next.resolve(true);
+		}
+	}
+
+	cancel(record: TaskRecord): void {
+		this.queue = this.queue.filter((item) => {
+			if (item.record !== record) return true;
+			item.resolve(false);
+			return false;
+		});
+	}
+}
+
+interface TaskTreeRow {
+	record: TaskRecord | SavedTask;
+	prefix: string;
+}
+
 class SubagentManager {
 	private tasks = new Map<string, TaskRecord>();
 	private pending: TaskResult[] = [];
 	private sent = new Set<string>();
 	private context?: ExtensionContext;
 	private waiters: Waiter[] = [];
-	private slotWaiters: Array<() => void> = [];
+	private activityWaiters = new Set<() => void>();
+	private needsTurn = false;
+	private suspensions = 0;
+	private lentSlot = false;
 	private flushTimer?: ReturnType<typeof setTimeout>;
 	private ticker?: ReturnType<typeof setInterval>;
 	private ui?: ExtensionContext["ui"];
 	private closed = false;
-	private active = 0;
-	private readonly maxConcurrent = (() => {
-		const raw = Number(CONFIG.maxConcurrent ?? 2);
-		if (!Number.isFinite(raw)) return 2;
-		return Math.max(1, Math.min(32, Math.floor(raw)));
-	})();
-
-	constructor(private pi: ExtensionAPI) {}
+	constructor(
+		private pi: ExtensionAPI,
+		private tree = new TaskTree(),
+		private host?: TaskRecord,
+	) {
+		if (host) host.descendants = this;
+		else this.tree.onChange = () => this.renderWidget();
+	}
 
 	setContext(ctx: ExtensionContext): void {
 		this.ui = ctx.ui;
@@ -1022,9 +1090,11 @@ class SubagentManager {
 
 	private renderWidget(): void {
 		if (this.closed) return;
-		const active = this.list().filter(
-			(record) => record.status === "queued" || record.status === "running",
-		);
+		if (this.host) {
+			this.tree.onChange?.();
+			return;
+		}
+		const active = this.context ? this.treeRows(this.context, false) : [];
 		if (active.length === 0) {
 			this.stopTicker();
 			try {
@@ -1036,7 +1106,8 @@ class SubagentManager {
 		}
 		this.ensureTicker();
 		const lines = [`Subagents · ${active.length} active`];
-		for (const record of active.slice(0, 6)) {
+		for (const { record, prefix } of active.slice(0, 6)) {
+			if (!("startedAt" in record)) continue;
 			const elapsed = Math.max(0, Math.round((Date.now() - record.startedAt) / 1000));
 			const icon = record.status === "queued" ? "○" : "●";
 			const activity = record.activity ? ` · ${record.activity}` : "";
@@ -1045,7 +1116,7 @@ class SubagentManager {
 				record.resolvedModel ?? record.modelSpec,
 				record.resolvedThinking ?? record.thinking,
 			);
-			lines.push(`${icon} ${record.agent} ${record.name} · ${elapsed}s · ${model}${tools}${activity}`);
+			lines.push(`${prefix}${icon} ${record.agent} ${record.name} · ${elapsed}s · ${model}${tools}${activity}`);
 		}
 		if (active.length > 6) lines.push(`+${active.length - 6} more`);
 		try {
@@ -1096,7 +1167,7 @@ class SubagentManager {
 			};
 			this.tasks.set(id, record);
 			records.push(record);
-			void this.run(ctx, record, input);
+			record.runPromise = this.run(ctx, record, input);
 		}
 		this.renderWidget();
 		return records;
@@ -1140,22 +1211,40 @@ class SubagentManager {
 			sessionFile: saved.sessionFile,
 		};
 		this.tasks.set(id, record);
-		void this.run(ctx, record, { task, agent: saved.agent, resume: true }, sessionManager);
+		record.runPromise = this.run(ctx, record, { task, agent: saved.agent, resume: true }, sessionManager);
 		return record;
 	}
 
-	private async acquire(): Promise<void> {
-		if (this.active < this.maxConcurrent) {
-			this.active++;
-			return;
+	private async suspended<T>(work: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+		if (this.suspensions++ === 0) {
+			this.lentSlot = this.host?.slotHeld === true;
+			if (this.lentSlot) this.tree.release(this.host!);
 		}
-		await new Promise<void>((resolve) => this.slotWaiters.push(resolve));
+		try {
+			return await work();
+		} finally {
+			// Parallel waits must all settle before their parent takes a slot back.
+			if (--this.suspensions === 0 && this.lentSlot) {
+				this.lentSlot = false;
+				if (!this.closed && !signal?.aborted && !this.host!.stopRequested) await this.tree.acquire(this.host!);
+			}
+		}
 	}
 
-	private release(): void {
-		const next = this.slotWaiters.shift();
-		if (next) next();
-		else this.active = Math.max(0, this.active - 1);
+	private signalActivity(): void {
+		for (const resolve of this.activityWaiters) resolve();
+		this.activityWaiters.clear();
+	}
+
+	private async waitForActivity(): Promise<void> {
+		await this.suspended(async () => {
+			if (this.closed || this.needsTurn || !this.hasLive()) return;
+			await new Promise<void>((resolve) => this.activityWaiters.add(resolve));
+		});
+	}
+
+	async settled(): Promise<void> {
+		await Promise.allSettled([...this.tasks.values()].map((record) => record.runPromise));
 	}
 
 	private async run(
@@ -1164,9 +1253,9 @@ class SubagentManager {
 		input: TaskInput,
 		existingSessionManager?: SessionManager,
 	): Promise<void> {
-		await this.acquire();
+		if (!await this.tree.acquire(record)) return;
 		if (this.closed || record.finished || record.stopRequested) {
-			this.release();
+			this.tree.release(record);
 			return;
 		}
 		record.status = "running";
@@ -1178,6 +1267,8 @@ class SubagentManager {
 			const dir = sessionDir(ctx);
 			mkdirSync(dir, { recursive: true });
 			const sessionManager = existingSessionManager ?? SessionManager.create(ctx.cwd, dir);
+			record.sessionId = sessionManager.getSessionId();
+			record.sessionFile = sessionManager.getSessionFile() ?? record.sessionFile;
 			if (!existingSessionManager) {
 				sessionManager.appendCustomEntry("omp-subagent", {
 					version: 1,
@@ -1200,12 +1291,29 @@ class SubagentManager {
 					createdAt: record.startedAt,
 				});
 			}
-			const settings = SettingsManager.create(ctx.cwd, getAgentDir());
+			const settings = SettingsManager.create(ctx.cwd, getAgentDir(), {
+				projectTrusted: ctx.isProjectTrusted(),
+			});
+			let childApi: ExtensionAPI | undefined;
 			const loader = new DefaultResourceLoader({
 				cwd: ctx.cwd,
 				agentDir: getAgentDir(),
 				settingsManager: settings,
-				noExtensions: true,
+				extensionFactories: [
+					{ name: "codemode", factory: createCodemodeExtension(), builtin: true, replaceable: true },
+					{ name: "tool-search", factory: createToolSearchExtension(), builtin: true, replaceable: true },
+					{ name: "mcp", factory: createMcpExtension(), builtin: true, replaceable: true },
+					{ name: "subagents-child", factory: (api) => { childApi = api; } },
+				],
+				extensionsOverride: (base) => {
+					// Replace only this plugin's discovered copy, keeping every other extension.
+					// Register after discovery to avoid duplicate-tool diagnostics and share the tree.
+					const extensions = base.extensions.filter((extension) =>
+						extension.tools.get("task")?.definition.description !== TASK_DESCRIPTION);
+					if (!childApi) throw new Error("Subagent extension failed to initialize");
+					subagents(childApi, this.tree, record);
+					return { ...base, extensions };
+				},
 				noSkills: true,
 				noThemes: true,
 				noPromptTemplates: true,
@@ -1263,6 +1371,18 @@ class SubagentManager {
 				: prompt;
 			record.promptStarted = true;
 			await child.prompt(promptWithPending);
+			// SDK sessions have no interactive host to keep an idle delegating agent alive.
+			// Park it while descendants work, then run the follow-up under the same budget.
+			const descendants = record.descendants;
+			while (!record.stopRequested && !["aborted", "error", "length"].includes(lastAssistant?.stopReason)
+				&& descendants && !descendants.closed && (descendants.hasLive() || descendants.needsTurn)) {
+				await descendants.waitForActivity();
+				if (record.stopRequested || descendants.closed) break;
+				if (!descendants.needsTurn) continue;
+				descendants.flushPending();
+				descendants.needsTurn = false;
+				await child.prompt("Subagent results are available above.");
+			}
 			// Read this run's events, not old history (whose length can change during compaction).
 			const last = lastAssistant;
 			record.result = textOf(last);
@@ -1285,24 +1405,35 @@ class SubagentManager {
 				clearTimeout(record.stopTimer);
 				record.stopTimer = undefined;
 			}
-			record.endedAt = Date.now();
-			record.finished = true;
 			try {
 				record.unsubscribe?.();
 			} catch {
 				// Best effort.
 			}
-			try {
-				record.child?.dispose?.();
-			} catch {
-				// Best effort.
-			}
+			await this.closeChild(record);
+			record.endedAt = Date.now();
+			record.finished = true;
 			// Capacity belongs to the actual run, not to an early stop notification.
-			this.release();
+			this.tree.release(record);
 			if (!record.finalized) this.deliver(record);
 			this.settleWaiters();
 			this.renderWidget();
 		}
+	}
+
+	private closeChild(record: TaskRecord): Promise<void> {
+		return record.cleanupPromise ??= (async () => {
+			record.descendants?.shutdown();
+			await record.descendants?.settled();
+			try {
+				// AgentSession.dispose() alone does not emit shutdown (MCP cleanup needs it).
+				await record.child?.extensionRunner?.emit({ type: "session_shutdown", reason: "quit" });
+			} catch {
+				// One extension's shutdown error must not leak the session.
+			} finally {
+				try { record.child?.dispose?.(); } catch { /* Best effort. */ }
+			}
+		})();
 	}
 
 	private async childRuntime(ctx: ExtensionContext): Promise<ModelRuntime> {
@@ -1346,6 +1477,8 @@ class SubagentManager {
 			return;
 		}
 		this.pending.push(result);
+		this.needsTurn = true;
+		this.signalActivity();
 		this.scheduleFlush();
 		this.settleWaiters();
 	}
@@ -1406,6 +1539,7 @@ class SubagentManager {
 				{ triggerTurn: false },
 			);
 			for (const result of results) this.sent.add(result.deliveryId);
+			if (this.host) return; // The owning run loop schedules child follow-ups safely.
 			this.pi.sendMessage(
 				{ customType: "subagent-ready", content: "Subagent results are available above.", display: false },
 				{ deliverAs: "followUp", triggerTurn: true },
@@ -1416,11 +1550,16 @@ class SubagentManager {
 	}
 
 	async wait(signal?: AbortSignal): Promise<TaskResult | undefined> {
+		return this.suspended(() => this.waitResult(signal), signal);
+	}
+
+	private async waitResult(signal?: AbortSignal): Promise<TaskResult | undefined> {
 		if (signal?.aborted) throw new Error("aborted");
 		this.pruneDelivered();
 		if (this.pending.length > 0) {
 			const result = this.pending.shift()!;
 			this.sent.delete(result.deliveryId);
+			if (this.pending.length === 0) this.needsTurn = false;
 			this.scheduleFlush();
 			return result;
 		}
@@ -1515,8 +1654,16 @@ class SubagentManager {
 
 	stop(id: string): TaskRecord | undefined {
 		const record = this.tasks.get(id);
-		if (!record) return undefined;
+		if (!record) {
+			for (const child of this.tasks.values()) {
+				const nested = child.descendants?.stop(id);
+				if (nested) return nested;
+			}
+			return undefined;
+		}
 		if (record.status === "queued") {
+			record.stopRequested = true;
+			this.tree.cancel(record);
 			record.status = "stopped";
 			record.error = "Stopped by user";
 			record.endedAt = Date.now();
@@ -1529,6 +1676,8 @@ class SubagentManager {
 			record.status = "stopped";
 			record.error = "Stopped by user";
 			record.stopRequested = true;
+			this.tree.cancel(record);
+			record.descendants?.shutdown();
 			try {
 				record.child?.abort?.();
 			} catch {
@@ -1546,10 +1695,10 @@ class SubagentManager {
 		record.endedAt = Date.now();
 		try {
 			record.child?.abort?.();
-			record.child?.dispose?.();
 		} catch {
 			// Best effort.
 		}
+		void this.closeChild(record);
 		// Report the stop, but do not reuse its slot or transcript until run() settles.
 		this.deliver(record);
 		this.renderWidget();
@@ -1574,6 +1723,28 @@ class SubagentManager {
 		}
 	}
 
+	treeRows(ctx: ExtensionContext, includeSaved = true): TaskTreeRow[] {
+		const rows: TaskTreeRow[] = [];
+		const visited = new Set<string>([ctx.sessionManager.getSessionId()]);
+		const walk = (owner: SubagentManager | undefined, sessionId: string, indent: string, nested: boolean) => {
+			const live = owner?.list() ?? [];
+			const ids = new Set(live.map((record) => record.id));
+			const records: Array<TaskRecord | SavedTask> = includeSaved
+				? [...live, ...loadSaved(ctx, sessionId).filter((record) => !ids.has(record.id))]
+				: live.filter((record) => !record.finished);
+			for (const [index, record] of records.entries()) {
+				const last = index === records.length - 1;
+				rows.push({ record, prefix: nested ? `${indent}${last ? "└─ " : "├─ "}` : "" });
+				if (!record.sessionId || visited.has(record.sessionId)) continue;
+				visited.add(record.sessionId);
+				walk((record as TaskRecord).descendants, record.sessionId,
+					nested ? `${indent}${last ? "   " : "│  "}` : "", true);
+			}
+		};
+		walk(this, ctx.sessionManager.getSessionId(), "", false);
+		return rows;
+	}
+
 	async listAll(ctx: ExtensionContext): Promise<Array<TaskRecord | SavedTask>> {
 		cleanOrphans();
 		const active = this.list();
@@ -1583,7 +1754,7 @@ class SubagentManager {
 
 	async getAny(ctx: ExtensionContext, id: string): Promise<TaskRecord | SavedTask | undefined> {
 		cleanOrphans();
-		return this.tasks.get(id) ?? loadSaved(ctx).find((item) => item.id === id);
+		return this.tasks.get(id) ?? this.treeRows(ctx).find(({ record }) => record.id === id)?.record;
 	}
 
 	shutdown(): void {
@@ -1601,9 +1772,12 @@ class SubagentManager {
 		this.pending.length = 0;
 		this.sent.clear();
 		for (const waiter of this.waiters.splice(0)) waiter.reject(new Error("Session closed"));
-		for (const resolve of this.slotWaiters.splice(0)) resolve();
-		this.active = 0;
+		this.signalActivity();
+		if (!this.host) this.tree.onChange = undefined;
 		for (const record of this.tasks.values()) {
+			record.stopRequested = true;
+			this.tree.cancel(record);
+			record.descendants?.shutdown();
 			if (record.stopTimer) {
 				clearTimeout(record.stopTimer);
 				record.stopTimer = undefined;
@@ -1617,7 +1791,7 @@ class SubagentManager {
 				record.status = "stopped";
 				record.error = "Session closed";
 				record.endedAt = Date.now();
-				record.finished = true;
+				if (!record.child) record.finished = true;
 			}
 			try {
 				record.child?.abort?.();
@@ -1628,17 +1802,18 @@ class SubagentManager {
 	}
 }
 
-export default function (pi: ExtensionAPI) {
+export default function subagents(pi: ExtensionAPI, tree?: TaskTree, host?: TaskRecord) {
 	let manager: SubagentManager | undefined;
 
 	const getManager = (ctx: ExtensionContext): SubagentManager => {
-		if (!manager) manager = new SubagentManager(pi);
+		if (!manager) manager = new SubagentManager(pi, tree, host);
 		manager.setContext(ctx);
 		return manager;
 	};
 
-	pi.on("session_start", () => {
+	pi.on("session_start", (_event, ctx) => {
 		cleanOrphans();
+		getManager(ctx);
 	});
 
 	pi.on("session_shutdown", () => {
@@ -1798,15 +1973,17 @@ export default function (pi: ExtensionAPI) {
 				}
 				return;
 			}
-			const records = await mgr.listAll(ctx);
-			if (records.length === 0) {
+			cleanOrphans();
+			const rows = mgr.treeRows(ctx);
+			if (rows.length === 0) {
 				ctx.ui.notify("No subagents in this session.", "info");
 				return;
 			}
-			const labels = records.map((record) => agentListLabel(record, ctx.ui.theme));
+			const labels = rows.map(({ record, prefix }) =>
+				ctx.ui.theme.fg("dim", prefix) + agentListLabel(record, ctx.ui.theme));
 			const choice = await ctx.ui.select("Subagents", labels);
 			if (!choice) return;
-			const selected = records.find((record) => choice.startsWith(record.id));
+			const selected = rows[labels.indexOf(choice)]?.record;
 			if (!selected) return;
 			if (selected.sessionFile) {
 				await showTranscript(ctx, selected.id, selected);
