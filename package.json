@@ -56,7 +56,8 @@
     "node": ">=22.19.0"
   },
   "scripts": {
-    "test": "node --experimental-vm-modules --test test/*.test.mjs"
+    "test": "node --experimental-vm-modules --test test/*.test.mjs",
+    "test:sdk": "node test/sdk-smoke.mjs wait && node test/sdk-smoke.mjs idle"
   },
   "devDependencies": {
     "@types/node": "^26.6.6",
