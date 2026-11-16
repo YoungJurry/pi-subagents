@@ -485,15 +485,26 @@ function statusIcon(status: string): string {
 	}
 }
 
-function statusColor(status: string): string {
+function statusColor(status: string): "warning" | "accent" | "success" | "error" | "muted" | "dim" {
 	switch (status) {
-		case "queued": return "dim";
-		case "running": return "warning";
+		case "queued": return "warning";
+		case "running": return "accent";
 		case "completed": return "success";
 		case "failed": return "error";
 		case "stopped": return "muted";
+		case "saved": return "dim";
 		default: return "muted";
 	}
+}
+
+function agentListLabel(record: TaskRecord | SavedTask, theme: ExtensionContext["ui"]["theme"]): string {
+	const model = modelLabel(
+		"resolvedModel" in record ? record.resolvedModel ?? record.modelSpec : record.modelSpec,
+		"resolvedThinking" in record ? record.resolvedThinking ?? record.thinking : record.thinking,
+	);
+	const status = theme.fg(statusColor(record.status), record.status.padEnd(9));
+	// Leave the id unstyled: the selector uses this prefix to recover the chosen record.
+	return `${record.id}  ${status}  ${record.agent.padEnd(8)}  ${record.name}  ${model}`;
 }
 
 function framedRow(theme: any, content: string, innerWidth: number, selected = false): string {
@@ -1792,13 +1803,7 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify("No subagents in this session.", "info");
 				return;
 			}
-			const labels = records.map((record) => {
-				const model = modelLabel(
-					"resolvedModel" in record ? record.resolvedModel ?? record.modelSpec : record.modelSpec,
-					"resolvedThinking" in record ? record.resolvedThinking ?? record.thinking : record.thinking,
-				);
-				return `${record.id}  ${record.status.padEnd(9)}  ${record.agent.padEnd(8)}  ${record.name}  ${model}`;
-			});
+			const labels = records.map((record) => agentListLabel(record, ctx.ui.theme));
 			const choice = await ctx.ui.select("Subagents", labels);
 			if (!choice) return;
 			const selected = records.find((record) => choice.startsWith(record.id));

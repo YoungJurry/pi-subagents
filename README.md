@@ -181,6 +181,10 @@ thinking, refresh, and Esc to close.
 
 ## TUI
 
+The `/subagents` picker colors statuses using the active Pi theme: running uses
+accent, queued uses warning, completed uses success, failed uses error, stopped
+uses muted, and saved uses dim. Agent ids stay unstyled for reliable selection.
+
 A widget below the editor shows active/queued tasks, elapsed time, resolved
 `provider/model:thinking`, tool count, and the last tool. It is placed
 `belowEditor` so it does not compete with Pi Voice's above-editor widget.

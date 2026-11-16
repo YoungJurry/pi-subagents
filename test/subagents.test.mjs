@@ -11,7 +11,7 @@ import vm from "node:vm";
 const source = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
 const js = ts.transpileModule(source, {
     compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
-}).outputText + "\nexport { SubagentManager, parseFrontmatter, formatResult };\n";
+}).outputText + "\nexport { SubagentManager, parseFrontmatter, formatResult, agentListLabel };\n";
 const deferred = () => {
     let resolve;
     const promise = new Promise((done) => { resolve = done; });
@@ -574,6 +574,31 @@ test("a global default does not change the parent's model selection", async (t) 
     await until(() => record.finished);
     assert.equal(f.ctx.model, parentModel);
     assert.equal(f.ctx.model.id, "model");
+});
+
+test("subagent list colors each status without styling the selection id", async (t) => {
+    const f = await fixture(t);
+    const colors = { running: "accent", queued: "warning", completed: "success", failed: "error", stopped: "muted", saved: "dim" };
+    for (const [status, expectedColor] of Object.entries(colors)) {
+        const calls = [];
+        const theme = { fg(color, text) { calls.push({ color, text }); return `\u001b[36m${text}\u001b[39m`; } };
+        const record = { id: "agent-123", agent: "scout", name: "test", status, modelSpec: "test/model", thinking: "high" };
+        const label = f.exports.agentListLabel(record, theme);
+        assert.equal(calls[0].color, expectedColor);
+        assert.equal(calls[0].text, status.padEnd(9));
+        assert.ok(label.startsWith(record.id));
+        const plain = label.replace(/\u001b\[[0-9;]*m/g, "");
+        assert.equal(plain, `${record.id}  ${status.padEnd(9)}  scout     test  test/model:high`);
+    }
+});
+
+test("colored labels keep the resolved runtime model and saved-session fallback", async (t) => {
+    const f = await fixture(t);
+    const theme = { fg(_color, text) { return text; } };
+    const live = { id: "agent-live", agent: "task", name: "live", status: "running", modelSpec: "test/old", resolvedModel: "test/new", thinking: "low", resolvedThinking: "high" };
+    assert.ok(f.exports.agentListLabel(live, theme).endsWith("test/new:high"));
+    const saved = { id: "agent-saved", agent: "scout", name: "saved", status: "saved" };
+    assert.ok(f.exports.agentListLabel(saved, theme).endsWith("inherit:inherit"));
 });
 
 test("custom agent frontmatter supports Windows line endings", async (t) => {
