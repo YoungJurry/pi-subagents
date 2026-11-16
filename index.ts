@@ -129,6 +129,7 @@ interface TaskRecord {
 	slotHeld?: boolean;
 	runPromise?: Promise<void>;
 	cleanupPromise?: Promise<void>;
+	parked?: boolean;
 }
 
 interface TaskResult {
@@ -439,6 +440,15 @@ function readTail(file: string, bytes = 200_000): string {
 	}
 }
 
+function transcriptMessage(entry: any): any | undefined {
+	if (entry.type === "message") return entry.message;
+	if (entry.type !== "custom_message" || entry.display === false) return undefined;
+	return {
+		role: "custom", customType: entry.customType, content: entry.content,
+		display: true, details: entry.details, timestamp: Date.parse(entry.timestamp) || 0,
+	};
+}
+
 function transcriptText(file: string): string {
 	if (!existsSync(file)) return "(transcript not found)";
 	const lines = readTail(file).trim().split("\n").slice(-2000);
@@ -446,11 +456,13 @@ function transcriptText(file: string): string {
 	for (const line of lines) {
 		try {
 			const entry = JSON.parse(line);
-			if (entry.type !== "message") continue;
-			const message = entry.message;
+			const message = transcriptMessage(entry);
 			if (message?.role === "user") {
 				const text = textOf(message);
 				if (text) out.push(`USER:\n${text}`);
+			} else if (message?.role === "custom") {
+				const text = textOf(message);
+				if (text) out.push(`${message.customType}:\n${text}`);
 			} else if (message?.role === "assistant") {
 				const text = textOf(message);
 				if (text) out.push(`ASSISTANT:\n${text}`);
@@ -555,7 +567,8 @@ function buildSnapshot(task: TaskRecord | SavedTask, cwd: string): TranscriptSna
 			} catch {
 				continue;
 			}
-			if (entry.type === "message" && entry.message) messages.push(entry.message);
+			const message = transcriptMessage(entry);
+			if (message) messages.push(message);
 		}
 	}
 	const record = task as TaskRecord;
@@ -866,6 +879,7 @@ function readHead(file: string, bytes = 65536): string {
 }
 
 function loadSaved(ctx: ExtensionContext, parentSessionId = ctx.sessionManager.getSessionId()): SavedTask[] {
+	if (!/^[\w-]+$/.test(parentSessionId)) return [];
 	const dir = join(getAgentDir(), "subagents", parentSessionId);
 	if (!existsSync(dir)) return [];
 	const saved: SavedTask[] = [];
@@ -921,7 +935,7 @@ function loadSaved(ctx: ExtensionContext, parentSessionId = ctx.sessionManager.g
 			createdAt: Number(meta.createdAt ?? Date.parse(header?.timestamp ?? "")) || 0,
 			status: "saved",
 			parentSessionFile: meta.parentSessionFile ?? null,
-			sessionId: header?.id,
+			sessionId: typeof header?.id === "string" && /^[\w-]+$/.test(header.id) ? header.id : undefined,
 		});
 	}
 	return saved.sort((a, b) => b.createdAt - a.createdAt);
@@ -1055,6 +1069,8 @@ class SubagentManager {
 	private waiters: Waiter[] = [];
 	private activityWaiters = new Set<() => void>();
 	private needsTurn = false;
+	private revision = 0;
+	private childFlush?: Promise<boolean>;
 	private suspensions = 0;
 	private lentSlot = false;
 	private flushTimer?: ReturnType<typeof setTimeout>;
@@ -1127,6 +1143,7 @@ class SubagentManager {
 	}
 
 	async start(ctx: ExtensionContext, context: string, tasks: TaskInput[]): Promise<TaskRecord[]> {
+		if (this.closed) throw new Error("Session closed");
 		const agents = loadAgents(ctx);
 		const prepared = tasks.map((input) => {
 			const agentDef = resolveAgent(agents, input.agent);
@@ -1180,12 +1197,13 @@ class SubagentManager {
 		modelSpec?: string,
 		thinking?: string,
 	): Promise<TaskRecord> {
+		if (this.closed) throw new Error("Session closed");
 		const active = this.tasks.get(id);
 		if (active && !active.finished) {
 			throw new Error(`Subagent ${id} is still running or stopping`);
 		}
 		const saved = loadSaved(ctx).find((item) => item.id === id);
-		if (!saved) throw new Error(`Unknown subagent: ${id}`);
+		if (!saved) throw this.missingTask(ctx, id);
 		const agentDef = resolveAgent(loadAgents(ctx), saved.agent);
 		// Preserve a resumed child's saved selection; defaults only fill an unset model.
 		const selectedModel = modelSpec ?? saved.modelSpec ?? agentDef.model ?? defaultModelSpec();
@@ -1215,7 +1233,7 @@ class SubagentManager {
 		return record;
 	}
 
-	private async suspended<T>(work: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+	private async suspended<T>(work: () => Promise<T>): Promise<T> {
 		if (this.suspensions++ === 0) {
 			this.lentSlot = this.host?.slotHeld === true;
 			if (this.lentSlot) this.tree.release(this.host!);
@@ -1226,7 +1244,10 @@ class SubagentManager {
 			// Parallel waits must all settle before their parent takes a slot back.
 			if (--this.suspensions === 0 && this.lentSlot) {
 				this.lentSlot = false;
-				if (!this.closed && !signal?.aborted && !this.host!.stopRequested) await this.tree.acquire(this.host!);
+				// A cancelled tool/script is not necessarily an aborted parent run.
+				if (!this.closed && !this.host!.stopRequested && !this.host!.child?.agent?.signal?.aborted) {
+					await this.tree.acquire(this.host!);
+				}
 			}
 		}
 	}
@@ -1237,10 +1258,15 @@ class SubagentManager {
 	}
 
 	private async waitForActivity(): Promise<void> {
-		await this.suspended(async () => {
-			if (this.closed || this.needsTurn || !this.hasLive()) return;
-			await new Promise<void>((resolve) => this.activityWaiters.add(resolve));
-		});
+		if (this.host) this.host.parked = true;
+		try {
+			await this.suspended(async () => {
+				if (this.closed || this.needsTurn || !this.hasLive()) return;
+				await new Promise<void>((resolve) => this.activityWaiters.add(resolve));
+			});
+		} finally {
+			if (this.host) this.host.parked = false;
+		}
 	}
 
 	async settled(): Promise<void> {
@@ -1255,7 +1281,12 @@ class SubagentManager {
 	): Promise<void> {
 		if (!await this.tree.acquire(record)) return;
 		if (this.closed || record.finished || record.stopRequested) {
+			record.status = "stopped";
+			record.stopRequested = true;
+			record.finished = true;
+			record.endedAt = Date.now();
 			this.tree.release(record);
+			this.settleWaiters();
 			return;
 		}
 		record.status = "running";
@@ -1308,8 +1339,9 @@ class SubagentManager {
 				extensionsOverride: (base) => {
 					// Replace only this plugin's discovered copy, keeping every other extension.
 					// Register after discovery to avoid duplicate-tool diagnostics and share the tree.
-					const extensions = base.extensions.filter((extension) =>
-						extension.tools.get("task")?.definition.description !== TASK_DESCRIPTION);
+					const extensions = base.extensions.filter((extension) => !(
+						extension.tools.has("task") && extension.tools.has("wait") && extension.tools.has("agent")
+						&& extension.commands.has("subagents")));
 					if (!childApi) throw new Error("Subagent extension failed to initialize");
 					subagents(childApi, this.tree, record);
 					return { ...base, extensions };
@@ -1339,6 +1371,7 @@ class SubagentManager {
 				tools: agentDef.tools,
 			});
 			record.child = child;
+			if (this.closed || record.stopRequested) throw new Error("Stopped by user");
 			record.toolDefinitions = new Map(
 				child.getAllTools().map((tool: any) => [tool.name, child.getToolDefinition(tool.name)]),
 			);
@@ -1379,9 +1412,18 @@ class SubagentManager {
 				await descendants.waitForActivity();
 				if (record.stopRequested || descendants.closed) break;
 				if (!descendants.needsTurn) continue;
-				descendants.flushPending();
-				descendants.needsTurn = false;
-				await child.prompt("Subagent results are available above.");
+				const deliveredRevision = await descendants.flushChildPending();
+				if (deliveredRevision === undefined) {
+					record.result = descendants.pending.map(formatResult).join("\n");
+					throw new Error("Unable to deliver descendant results; undelivered reports are attached");
+				}
+				descendants.needsTurn = descendants.revision !== deliveredRevision;
+				const queued = record.pendingMessages?.splice(0) ?? [];
+				lastAssistant = undefined;
+				await child.prompt(queued.length > 0
+					? `# Queued message\n${queued.join("\n\n")}`
+					: "Subagent results are available above.");
+				if (!lastAssistant) break;
 			}
 			// Read this run's events, not old history (whose length can change during compaction).
 			const last = lastAssistant;
@@ -1422,17 +1464,20 @@ class SubagentManager {
 	}
 
 	private closeChild(record: TaskRecord): Promise<void> {
+		const child = record.child;
+		// Creation can still be pending when a stop timer fires; do not cache a no-op.
+		if (!child) return Promise.resolve();
 		return record.cleanupPromise ??= (async () => {
 			record.descendants?.shutdown();
-			await record.descendants?.settled();
 			try {
-				// AgentSession.dispose() alone does not emit shutdown (MCP cleanup needs it).
-				await record.child?.extensionRunner?.emit({ type: "session_shutdown", reason: "quit" });
+				// Emit before waiting for descendants: disconnecting MCP can unblock tools.
+				await child.extensionRunner?.emit({ type: "session_shutdown", reason: "quit" });
 			} catch {
 				// One extension's shutdown error must not leak the session.
 			} finally {
-				try { record.child?.dispose?.(); } catch { /* Best effort. */ }
+				try { child.dispose?.(); } catch { /* Best effort. */ }
 			}
+			await record.descendants?.settled();
 		})();
 	}
 
@@ -1478,13 +1523,14 @@ class SubagentManager {
 		}
 		this.pending.push(result);
 		this.needsTurn = true;
+		this.revision++;
 		this.signalActivity();
 		this.scheduleFlush();
 		this.settleWaiters();
 	}
 
 	private hasActive(): boolean {
-		return [...this.tasks.values()].some((record) => !record.finished);
+		return [...this.tasks.values()].some((record) => !record.finished && !record.finalized);
 	}
 
 	private settleWaiters(): void {
@@ -1520,7 +1566,37 @@ class SubagentManager {
 		}, 50);
 	}
 
+	private async flushChildPending(): Promise<number | undefined> {
+		while (!this.closed) {
+			if (this.childFlush) {
+				if (!await this.childFlush) return undefined;
+				continue;
+			}
+			this.pruneDelivered();
+			const results = this.pending.filter((result) => !this.sent.has(result.deliveryId));
+			if (results.length === 0) return this.revision;
+			this.childFlush = (async () => {
+				try {
+					await this.host!.child.sendCustomMessage({
+						customType: "subagent-result", content: results.map(formatResult).join("\n"),
+						display: true, details: results.length === 1 ? results[0] : { results },
+					}, { triggerTurn: false });
+					for (const result of results) this.sent.add(result.deliveryId);
+					return true;
+				} catch {
+					return false;
+				}
+			})().finally(() => { this.childFlush = undefined; });
+			if (!await this.childFlush) return undefined;
+		}
+		return undefined;
+	}
+
 	private flushPending(): void {
+		if (this.host) {
+			void this.flushChildPending();
+			return;
+		}
 		if (this.closed || this.pending.length === 0) return;
 		this.pruneDelivered();
 		const results = this.pending.filter((result) => !this.sent.has(result.deliveryId));
@@ -1539,7 +1615,6 @@ class SubagentManager {
 				{ triggerTurn: false },
 			);
 			for (const result of results) this.sent.add(result.deliveryId);
-			if (this.host) return; // The owning run loop schedules child follow-ups safely.
 			this.pi.sendMessage(
 				{ customType: "subagent-ready", content: "Subagent results are available above.", display: false },
 				{ deliverAs: "followUp", triggerTurn: true },
@@ -1550,12 +1625,14 @@ class SubagentManager {
 	}
 
 	async wait(signal?: AbortSignal): Promise<TaskResult | undefined> {
-		return this.suspended(() => this.waitResult(signal), signal);
+		return this.suspended(() => this.waitResult(signal));
 	}
 
 	private async waitResult(signal?: AbortSignal): Promise<TaskResult | undefined> {
+		if (this.closed) throw new Error("Session closed");
 		if (signal?.aborted) throw new Error("aborted");
 		this.pruneDelivered();
+		if (this.pending.length === 0) this.needsTurn = false;
 		if (this.pending.length > 0) {
 			const result = this.pending.shift()!;
 			this.sent.delete(result.deliveryId);
@@ -1581,17 +1658,24 @@ class SubagentManager {
 		});
 	}
 
+	private missingTask(ctx: ExtensionContext, id: string): Error {
+		return new Error(this.treeRows(ctx).some(({ record }) => record.id === id)
+			? `Subagent ${id} belongs to a nested session; control it through its direct parent`
+			: `Unknown subagent: ${id}`);
+	}
+
 	private async switchModel(
 		ctx: ExtensionContext,
 		id: string,
 		modelSpec?: string,
 		thinking?: string,
 	): Promise<TaskRecord | SavedTask> {
+		if (this.closed) throw new Error("Session closed");
 		const model = modelSpec ? resolveModel(ctx, modelSpec) : undefined;
 		const active = this.tasks.get(id);
 		const saved = active ? undefined : loadSaved(ctx).find((item) => item.id === id);
 		const record = active ?? saved;
-		if (!record) throw new Error(`Unknown subagent: ${id}`);
+		if (!record) throw this.missingTask(ctx, id);
 		const nextModel = modelSpec ?? record.modelSpec;
 		const nextThinking = thinking ?? modelEffort(modelSpec) ?? record.thinking ?? modelEffort(nextModel);
 		if (active?.status === "running" && active.child) {
@@ -1625,9 +1709,18 @@ class SubagentManager {
 		modelSpec?: string,
 		thinking?: string,
 	): Promise<{ kind: "steered" | "queued" | "resumed"; record: TaskRecord }> {
+		if (this.closed) throw new Error("Session closed");
 		if (modelSpec || thinking) await this.switchModel(ctx, id, modelSpec, thinking);
 		const active = this.tasks.get(id);
 		if (active?.status === "running") {
+			if (active.parked || (active.child && active.promptStarted && active.child.isStreaming === false)) {
+				(active.pendingMessages ??= []).push(message);
+				if (active.descendants) {
+					active.descendants.needsTurn = true;
+					active.descendants.signalActivity();
+				}
+				return { kind: "queued", record: active };
+			}
 			if (active.child && active.promptStarted) {
 				await active.child.steer(message);
 				return { kind: "steered", record: active };
@@ -1700,7 +1793,9 @@ class SubagentManager {
 		}
 		void this.closeChild(record);
 		// Report the stop, but do not reuse its slot or transcript until run() settles.
+		record.error = "Stopped by user; cleanup is still pending";
 		this.deliver(record);
+		this.settleWaiters();
 		this.renderWidget();
 	}
 
@@ -1745,6 +1840,16 @@ class SubagentManager {
 		return rows;
 	}
 
+	cleanSaved(ctx: ExtensionContext): void {
+		if (this.hasLive()) throw new Error("Stop active subagents before cleaning saved sessions");
+		const ids = new Set(this.treeRows(ctx).map(({ record }) => record.sessionId).filter((id): id is string => !!id));
+		ids.add(ctx.sessionManager.getSessionId());
+		for (const id of ids) {
+			if (/^[\w-]+$/.test(id)) rmSync(join(getAgentDir(), "subagents", id), { recursive: true, force: true });
+		}
+		this.clearFinished();
+	}
+
 	async listAll(ctx: ExtensionContext): Promise<Array<TaskRecord | SavedTask>> {
 		cleanOrphans();
 		const active = this.list();
@@ -1758,6 +1863,7 @@ class SubagentManager {
 	}
 
 	shutdown(): void {
+		if (this.closed) return;
 		this.closed = true;
 		this.stopTicker();
 		try {
@@ -1798,6 +1904,7 @@ class SubagentManager {
 			} catch {
 				// Best effort.
 			}
+			void this.closeChild(record);
 		}
 	}
 }
@@ -1812,12 +1919,14 @@ export default function subagents(pi: ExtensionAPI, tree?: TaskTree, host?: Task
 	};
 
 	pi.on("session_start", (_event, ctx) => {
-		cleanOrphans();
+		if (!host) cleanOrphans();
 		getManager(ctx);
 	});
 
-	pi.on("session_shutdown", () => {
-		manager?.shutdown();
+	pi.on("session_shutdown", async () => {
+		const closing = manager;
+		closing?.shutdown();
+		await closing?.settled();
 		manager = undefined;
 	});
 
@@ -1936,11 +2045,10 @@ export default function subagents(pi: ExtensionAPI, tree?: TaskTree, host?: Task
 				}
 				const ok = await ctx.ui.confirm(
 					"Delete subagent sessions?",
-					`Delete ${dir}? This cannot be undone.`,
+					`Delete ${dir} and its descendant session groups? This cannot be undone.`,
 				);
 				if (!ok) return;
-				rmSync(dir, { recursive: true, force: true });
-				mgr.clearFinished();
+				mgr.cleanSaved(ctx);
 				ctx.ui.notify("Deleted saved subagent sessions.", "info");
 				return;
 			}

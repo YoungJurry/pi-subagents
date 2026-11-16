@@ -11,7 +11,7 @@ import vm from "node:vm";
 const source = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
 const js = ts.transpileModule(source, {
     compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
-}).outputText + "\nexport { SubagentManager, TaskTree, loadAgents, resolveAgent, SUBAGENT_PREAMBLE, parseFrontmatter, formatResult, agentListLabel };\n";
+}).outputText + "\nexport { SubagentManager, TaskTree, loadAgents, resolveAgent, SUBAGENT_PREAMBLE, parseFrontmatter, formatResult, agentListLabel, transcriptText, buildSnapshot };\n";
 const deferred = () => {
     let resolve;
     const promise = new Promise((done) => { resolve = done; });
@@ -33,6 +33,7 @@ async function fixture(t, options = {}) {
     const sessions = new Map();
     const children = [];
     const behaviors = [];
+    const startedGates = [];
     const parentEntries = [];
     const durable = [];
     const wakeups = [];
@@ -102,12 +103,12 @@ async function fixture(t, options = {}) {
         DefaultResourceLoader: class {
             constructor(options) { this.options = options; this.tools = []; this.hooks = new Map(); }
             async reload() {
-                const extension = { tools: new Map() };
+                const extension = { tools: new Map(), commands: new Map() };
                 const api = {
                     ...pi,
                     on: (name, handler) => this.hooks.set(name, handler),
                     registerTool: (tool) => { this.tools.push(tool); extension.tools.set(tool.name, { definition: tool }); },
-                    registerCommand() {},
+                    registerCommand(name, command) { extension.commands.set(name, command); },
                     sendMessage: (message, sendOptions) => {
                         this.child.reports.push(message);
                         this.child.sessionManager.entries.push({ type: "custom_message", ...message });
@@ -115,7 +116,7 @@ async function fixture(t, options = {}) {
                     },
                 };
                 for (const input of this.options.extensionFactories ?? []) input.factory?.(api);
-                const discovered = { path: "installed-subagents", tools: new Map([["task", { definition: tools[0] }]]) };
+                const discovered = { path: "installed-subagents", commands: new Map([["subagents", {}]]), tools: new Map(tools.map((tool) => [tool.name, { definition: { ...tool, description: "An older plugin description" } }])) };
                 const web = { path: "web-tools", tools: new Map(["web_search", "fetch", "codemode"].map((name) => [name, { definition: { name } }])) };
                 this.loaded = this.options.extensionsOverride?.({ extensions: [discovered, web, extension], errors: [], runtime: {} });
             }
@@ -123,8 +124,11 @@ async function fixture(t, options = {}) {
         ModelRuntime: { create: async () => ({}) },
         createAgentSession: async ({ sessionManager, model, thinkingLevel, resourceLoader, tools: selectedTools }) => {
             const behavior = behaviors.shift() ?? {};
+            for (const gate of [behavior.gate, behavior.creationGate]) if (gate) startedGates.push(gate);
             const listeners = new Set();
+            const abortController = new AbortController();
             const child = {
+                agent: { signal: abortController.signal },
                 messages: sessionManager.messages,
                 model,
                 thinkingLevel,
@@ -134,18 +138,28 @@ async function fixture(t, options = {}) {
                 reports: [],
                 backgroundTurns: 0,
                 turns: 0,
-                extensionRunner: { emit: async (event) => resourceLoader.hooks.get(event.type)?.(event, child.ctx) },
+                shutdownCount: 0,
+                extensionRunner: { emit: async (event) => {
+                    if (event.type === "session_shutdown") child.shutdownCount++;
+                    return resourceLoader.hooks.get(event.type)?.(event, child.ctx);
+                } },
+                async sendCustomMessage(message, sendOptions) {
+                    if (behavior.failReports) throw new Error("report send failed");
+                    this.reports.push(message);
+                    this.sessionManager.entries.push({ type: "custom_message", ...message });
+                    if (sendOptions.triggerTurn) this.backgroundTurns++;
+                },
                 callTool: async (name, params, signal) => {
                     const tool = resourceLoader.tools.find((item) => item.name === name);
                     assert.ok(tool, `missing child tool: ${name}`);
-                    return tool.execute("child-call", params, signal, undefined, child.ctx);
+                    return tool.execute("child-call", params, signal ?? child.agent.signal, undefined, child.ctx);
                 },
                 getAllTools: () => (resourceLoader.loaded?.extensions ?? []).flatMap((extension) => [...extension.tools.values()].map((tool) => tool.definition)),
                 getToolDefinition: (name) => (resourceLoader.loaded?.extensions ?? []).flatMap((extension) => [...extension.tools.values()]).find((tool) => tool.definition.name === name)?.definition,
                 subscribe: (listener) => { listeners.add(listener); return () => listeners.delete(listener); },
                 bindExtensions: async () => resourceLoader.hooks.get("session_start")?.({ type: "session_start" }, child.ctx),
                 dispose() { this.disposed = true; },
-                abort() { this.aborted = true; },
+                abort() { this.aborted = true; abortController.abort(); },
                 async setModel(next) { this.model = next; },
                 setThinkingLevel(next) { this.thinkingLevel = next; },
                 async steer(text) { this.steered = text; },
@@ -171,6 +185,7 @@ async function fixture(t, options = {}) {
             child.ctx = { ...ctx, sessionManager, model, thinkingLevel, ui: { setWidget() {}, notify() {} } };
             resourceLoader.child = child;
             children.push(child);
+            if (behavior.creationGate) await behavior.creationGate.promise;
             return { session: child };
         },
     };
@@ -215,10 +230,12 @@ async function fixture(t, options = {}) {
     module.namespace.default(pi);
     const manager = new module.namespace.SubagentManager(pi);
     manager.setContext(ctx);
-    t.after(() => {
+    t.after(async () => {
+        for (const gate of startedGates) gate.resolve();
+        for (const behavior of behaviors) { behavior.gate?.resolve(); behavior.creationGate?.resolve(); }
         manager.shutdown();
-        rootHandlers.get("session_shutdown")?.();
-        for (const behavior of behaviors) behavior.gate?.resolve();
+        await rootHandlers.get("session_shutdown")?.();
+        await manager.settled();
         rmSync(root, { recursive: true, force: true });
     });
     return {
@@ -886,6 +903,7 @@ test("an aborted nested wait does not block cleanup trying to reacquire a busy s
     const controller = new AbortController();
     f.behaviors.push({ async run(child) {
         await child.callTool("task", { context: "nested", tasks: [{ task: "blocked leaf" }] });
+        child.agent.signal = controller.signal; // Simulate the SDK parent run being aborted.
         await child.callTool("wait", {}, controller.signal);
     } }, { gate });
     const [record] = await f.start([{ task: "parent" }]);
@@ -927,6 +945,197 @@ test("active widget renders the same descendant tree rather than independent row
     assert.equal(f.manager.stop(descendant.id).status, "stopped");
     gate.resolve();
     await until(() => record.finished);
+});
+
+test("a nested follow-up without a new response cannot recycle the waiting answer", async (t) => {
+    const f = await fixture(t, { maxConcurrent: 1 });
+    const parent = { text: "waiting", async run(child) {
+        if (child.turns === 1) await child.callTool("task", { context: "nested", tasks: [{ task: "leaf" }] });
+        else parent.noResponse = true;
+    } };
+    f.behaviors.push(parent, { text: "leaf result" });
+    const [record] = await f.start([{ task: "parent" }]);
+    await until(() => record.finished);
+    assert.equal(record.status, "failed");
+    assert.equal(record.result, "");
+    assert.match(record.error, /no assistant text/);
+});
+
+test("a failed nested report delivery fails the parent and preserves the undelivered report", async (t) => {
+    const f = await fixture(t, { maxConcurrent: 1 });
+    f.behaviors.push({ failReports: true, async run(child) {
+        await child.callTool("task", { context: "nested", tasks: [{ task: "leaf" }] });
+    } }, { text: "irreplaceable leaf report" });
+    const [record] = await f.start([{ task: "parent" }]);
+    await until(() => record.finished);
+    assert.equal(record.status, "failed");
+    assert.match(record.error, /Unable to deliver descendant results/);
+    assert.ok(record.result.includes("irreplaceable leaf report"));
+    assert.equal(f.children[0].turns, 1);
+});
+
+test("explicit wait after an acknowledged report does not add a redundant parent turn", async (t) => {
+    const f = await fixture(t, { maxConcurrent: 2 });
+    f.behaviors.push({ text: "final answer", async run(child) {
+        if (child.turns !== 1) assert.fail("unexpected extra turn");
+        await child.callTool("task", { context: "nested", tasks: [{ task: "leaf" }] });
+        await delay(90);
+        assert.equal(child.reports.length, 1);
+        await child.callTool("wait", {});
+    } }, {});
+    const [record] = await f.start([{ task: "parent" }]);
+    await until(() => record.finished);
+    assert.equal(record.status, "completed", record.error);
+    assert.equal(f.children[0].turns, 1);
+    assert.equal(record.result, "final answer");
+});
+
+test("a force-stop during session creation still shuts down the late-created child", async (t) => {
+    const f = await fixture(t);
+    const creationGate = deferred();
+    f.behaviors.push({ creationGate });
+    const [record] = await f.start([{ task: "parent" }]);
+    await until(() => f.children.length === 1);
+    assert.equal(record.child, undefined);
+    f.manager.stop(record.id);
+    f.stopTimers[0].callback();
+    creationGate.resolve();
+    await until(() => record.finished);
+    assert.equal(f.children[0].disposed, true);
+    assert.equal(f.children[0].shutdownCount, 1);
+    assert.equal(f.manager.tree.active, 0);
+});
+
+test("closed managers reject new work rather than leaving ghost records", async (t) => {
+    const f = await fixture(t);
+    f.manager.shutdown();
+    await assert.rejects(f.start([{ task: "late" }]), /Session closed/);
+    await assert.rejects(f.manager.resume(f.ctx, "missing", "late"), /Session closed/);
+    await assert.rejects(f.manager.message(f.ctx, "missing", "late"), /Session closed/);
+    await assert.rejects(f.manager.wait(), /Session closed/);
+    assert.equal(f.manager.list().length, 0);
+    assert.equal(f.manager.tree.active, 0);
+});
+
+test("custom descendant reports are visible in both transcript render paths", async (t) => {
+    const f = await fixture(t);
+    const [record] = await f.start([{ task: "parent" }]);
+    await until(() => record.finished);
+    for (const [display, content] of [[true, "visible descendant result"], [false, "hidden wakeup"]]) {
+        appendFileSync(record.sessionFile, JSON.stringify({ type: "custom_message", customType: "subagent-result", display, content, timestamp: new Date().toISOString() }) + "\n");
+    }
+    const messages = f.exports.buildSnapshot(record, f.ctx.cwd).messages;
+    assert.equal(messages.length, 1);
+    assert.equal(messages[0].role, "custom");
+    assert.ok(f.exports.transcriptText(record.sessionFile).includes("visible descendant result"));
+    assert.ok(!f.exports.transcriptText(record.sessionFile).includes("hidden wakeup"));
+});
+
+test("clean removes the whole saved tree even when orphan cleanup is disabled", async (t) => {
+    const f = await fixture(t, { maxConcurrent: 1, config: { autoCleanOrphans: false } });
+    f.behaviors.push({ async run(child) {
+        if (child.turns === 1) await child.callTool("task", { context: "nested", tasks: [{ task: "leaf" }] });
+    } }, {});
+    const [record] = await f.start([{ task: "parent" }]);
+    await until(() => record.finished);
+    const files = f.manager.treeRows(f.ctx).map(({ record }) => record.sessionFile);
+    assert.equal(files.length, 2);
+    f.manager.cleanSaved(f.ctx);
+    assert.equal(f.manager.treeRows(f.ctx).length, 0);
+    for (const file of files) assert.throws(() => readFileSync(file), /ENOENT/);
+});
+
+test("force-stop reports cleanup pending without reusing an uncooperative descendant's slot", async (t) => {
+    const f = await fixture(t, { maxConcurrent: 1 });
+    const gate = deferred();
+    f.behaviors.push({ async run(child) {
+        await child.callTool("task", { context: "nested", tasks: [{ task: "blocked leaf" }] });
+        await child.callTool("wait", {});
+    } }, { gate });
+    const [record] = await f.start([{ task: "parent" }]);
+    await until(() => f.children.length === 2 && f.children[1].promptText);
+    f.manager.stop(record.id);
+    f.stopTimers[0].callback();
+    await until(() => f.children[1].shutdownCount === 1);
+    const report = await f.manager.wait();
+    assert.match(report.error, /cleanup is still pending/);
+    assert.equal(await f.manager.wait(), undefined);
+    assert.equal(record.finished, false);
+    assert.equal(f.manager.tree.active, 1);
+    gate.resolve();
+    await until(() => record.finished);
+    assert.equal(f.manager.tree.active, 0);
+});
+
+test("messages wake parked parents and are processed without waiting for every descendant", async (t) => {
+    const f = await fixture(t, { maxConcurrent: 2 });
+    const gate = deferred();
+    f.behaviors.push({ async run(child) {
+        if (child.turns === 1) await child.callTool("task", { context: "nested", tasks: [{ task: "leaf" }] });
+    } }, { gate });
+    const [record] = await f.start([{ task: "parent" }]);
+    await until(() => record.parked && f.children.length === 2);
+    const outcome = await f.manager.message(f.ctx, record.id, "extra parent instruction");
+    assert.equal(outcome.kind, "queued");
+    await until(() => f.children[0].turns === 2);
+    assert.ok(f.children[0].promptText.includes("extra parent instruction"));
+    assert.equal(f.children[1].disposed, undefined);
+    gate.resolve();
+    await until(() => record.finished);
+    assert.equal(record.status, "completed", record.error);
+});
+
+test("malformed saved session ids cannot traverse or clean outside the session root", async (t) => {
+    const f = await fixture(t);
+    const [record] = await f.start([{ task: "parent" }]);
+    await until(() => record.finished);
+    const entries = readFileSync(record.sessionFile, "utf8").trim().split("\n").map(JSON.parse);
+    entries[0].id = "../../..";
+    writeFileSync(record.sessionFile, entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n");
+    const restored = new f.exports.SubagentManager({ sendMessage() {} });
+    assert.equal(restored.treeRows(f.ctx)[0].record.sessionId, undefined);
+    restored.cleanSaved(f.ctx);
+    assert.equal(readFileSync(join(f.root, "subagents.json"), "utf8").length > 0, true);
+    restored.shutdown();
+});
+
+test("a cancelled script wait still reacquires the parent's slot when its run is not aborted", async (t) => {
+    const f = await fixture(t, { maxConcurrent: 1 });
+    const gate = deferred();
+    const controller = new AbortController();
+    f.behaviors.push({ async run(child) {
+        if (child.turns !== 1) return;
+        await child.callTool("task", { context: "nested", tasks: [{ task: "first" }, { task: "blocked second" }] });
+        await Promise.all([
+            child.callTool("wait", {}),
+            child.callTool("wait", {}, controller.signal).catch(() => "cancelled"),
+        ]);
+        assert.equal(child.agent.signal.aborted, false);
+        assert.equal(f.manager.tree.active, 1);
+    } }, {}, { gate });
+    const [record] = await f.start([{ task: "parent" }]);
+    await until(() => f.children.length === 3 && f.children[2].promptText);
+    controller.abort();
+    await delay(5);
+    assert.equal(record.slotHeld, false);
+    assert.equal(f.manager.tree.active, 1);
+    assert.ok(f.manager.tree.queue.some((item) => item.record === record));
+    gate.resolve();
+    await until(() => record.finished);
+    assert.equal(record.status, "completed", record.error);
+    assert.equal(f.manager.tree.active, 0);
+});
+
+test("nested follow-ups stay parent-scoped and explain how to address saved descendants", async (t) => {
+    const f = await fixture(t, { maxConcurrent: 1 });
+    f.behaviors.push({ async run(child) {
+        if (child.turns === 1) await child.callTool("task", { context: "nested", tasks: [{ task: "leaf" }] });
+    } }, {});
+    const [record] = await f.start([{ task: "parent" }]);
+    await until(() => record.finished);
+    const descendant = f.manager.treeRows(f.ctx)[1].record;
+    await assert.rejects(f.manager.resume(f.ctx, descendant.id, "continue"), /control it through its direct parent/);
+    await assert.rejects(f.manager.switchOnly(f.ctx, descendant.id, "test/other"), /control it through its direct parent/);
 });
 
 test("custom agent frontmatter supports Windows line endings", async (t) => {

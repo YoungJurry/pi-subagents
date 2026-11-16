@@ -215,7 +215,8 @@ flat list. Saved-session trees are reconstructed from their session IDs and
 parent session directories. Every picker row remains selectable, including
 indented descendants; `/subagents view` can also open a nested transcript.
 Stopping an active nested ID or its ancestor propagates down that branch.
-Follow-up/resume tools address the calling session's direct children.
+Follow-up/resume tools address the calling session's direct children. Cleaning
+saved sessions removes the whole descendant tree, even with orphan cleanup off.
 
 The `/subagents` picker colors statuses using the active Pi theme: running uses
 accent, queued uses warning, completed uses success, failed uses error, stopped
@@ -252,7 +253,9 @@ Actual totals depend on cwd/date, provider serialization, and other tools.
 - `scout`/`review` read-only is prompt-level, not a sandbox.
 - No per-task `cwd`, `isolated`, `steps`, `tools`, or `outputSchema`.
 - No child token/cost accounting.
-- `wait` has no timeout.
+- `wait` has no timeout. A forced stop reports when cleanup is still pending;
+  an uncooperative tool keeps its execution slot and transcript locked until it
+  actually settles. The plugin does not fake termination or reuse a busy session.
 - Viewer live refresh shows persisted messages; streaming partial output is not
   yet integrated.
 
