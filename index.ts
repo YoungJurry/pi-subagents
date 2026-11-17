@@ -28,15 +28,18 @@ import {
 	getAgentDir,
 	getMarkdownTheme,
 	ModelRuntime,
+	parseSessionEntries,
 	SessionManager,
 	SettingsManager,
 	ToolExecutionComponent,
 	UserMessageComponent,
+	type AgentSession,
 	type ExtensionAPI,
 	type ExtensionContext,
+	type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
-import { StringEnum } from "@earendil-works/pi-ai";
-import { Box, Container, matchesKey, Spacer, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { StringEnum, type AssistantMessage } from "@earendil-works/pi-ai";
+import { Container, matchesKey, Spacer, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 const DEFAULT_CONFIG_PATH = join(dirname(fileURLToPath(import.meta.url)), "config.json");
@@ -108,7 +111,7 @@ interface TaskRecord {
 	sessionFile?: string;
 	result?: string;
 	error?: string;
-	child?: any;
+	child?: AgentSession;
 	finished: boolean;
 	modelSpec?: string;
 	thinking?: string;
@@ -125,11 +128,14 @@ interface TaskRecord {
 	pendingMessages?: string[];
 	promptStarted?: boolean;
 	sessionId?: string;
+	sessionManager?: SessionManager;
+	selectionUpdate?: Promise<void>;
 	descendants?: SubagentManager;
 	slotHeld?: boolean;
 	runPromise?: Promise<void>;
 	cleanupPromise?: Promise<void>;
 	parked?: boolean;
+	extensionWarnings?: string[];
 }
 
 interface TaskResult {
@@ -142,6 +148,7 @@ interface TaskResult {
 	sessionFile?: string;
 	error?: string;
 	durationMs: number;
+	warnings?: string[];
 }
 
 interface SavedTask {
@@ -242,9 +249,6 @@ const AgentParams = Type.Object(
 const AGENT_DESCRIPTION =
 	"Control a subagent. message: steer a running target, queue for a starting target, or resume a finished/saved target. model/thinking: switch its model or thinking; with message, switch before delivery. At least one of message, model, or thinking is required.";
 
-const PI_TOOLS = new Set(["read", "bash", "edit", "write"]);
-const BASH_ALIASES = new Set(["grep", "find", "glob", "ls", "rg", "ast_grep"]);
-
 function parseList(value: string | undefined): string[] | undefined {
 	if (!value) return undefined;
 	const text = value.trim().replace(/^\[/, "").replace(/\]$/, "");
@@ -252,12 +256,11 @@ function parseList(value: string | undefined): string[] | undefined {
 		.split(",")
 		.map((item) => item.trim().replace(/^["']|["']$/g, ""))
 		.filter(Boolean);
-	return items.length > 0 ? items : undefined;
+	return items;
 }
 
 function normalizeTools(tools: string[] | undefined): string[] | undefined {
-	if (!tools) return undefined;
-	return [...new Set(tools.map((tool) => BASH_ALIASES.has(tool) ? "bash" : tool))];
+	return tools ? [...new Set(tools)] : undefined;
 }
 
 function parseFrontmatter(raw: string): { data: Record<string, string>; body: string } {
@@ -292,6 +295,10 @@ function parseFrontmatter(raw: string): { data: Record<string, string>; body: st
 	return { data, body: lines.slice(end + 1).join("\n").replace(/^\s*\n/, "") };
 }
 
+function optionalSetting(value: string | undefined): string | undefined {
+	return value && !/^(null|undefined|~)$/i.test(value) ? value : undefined;
+}
+
 function parseAgentFile(file: string, source: string): AgentDefinition | undefined {
 	try {
 		const raw = readFileSync(file, "utf8");
@@ -301,12 +308,12 @@ function parseAgentFile(file: string, source: string): AgentDefinition | undefin
 		return {
 			name,
 			description: data.description,
-			tools: normalizeTools(parseList(data.tools)),
+			tools: normalizeTools(parseList(optionalSetting(data.tools))),
 			prompt:
 				body.trim() ||
 				`You are the ${name} subagent. Complete only the assigned task and return a concise result.`,
-			model: data.model,
-			thinking: data.thinking || data["thinking-level"],
+			model: optionalSetting(data.model),
+			thinking: optionalSetting(data.thinking || data["thinking-level"]),
 			source,
 		};
 	} catch {
@@ -315,8 +322,10 @@ function parseAgentFile(file: string, source: string): AgentDefinition | undefin
 }
 
 function loadAgents(ctx: ExtensionContext): Record<string, AgentDefinition> {
-	const agents: Record<string, AgentDefinition> = { ...BUILTIN_AGENTS };
-	for (const dir of [join(getAgentDir(), "agents"), join(ctx.cwd, ".pi", "agents")]) {
+	const agents: Record<string, AgentDefinition> = Object.assign(Object.create(null), BUILTIN_AGENTS);
+	const dirs = [join(getAgentDir(), "agents")];
+	if (ctx.isProjectTrusted()) dirs.push(join(ctx.cwd, ".pi", "agents"));
+	for (const dir of dirs) {
 		if (!existsSync(dir)) continue;
 		let files: string[];
 		try {
@@ -335,7 +344,7 @@ function loadAgents(ctx: ExtensionContext): Record<string, AgentDefinition> {
 
 function resolveAgent(agents: Record<string, AgentDefinition>, name: string | undefined): AgentDefinition {
 	const key = name?.trim() || "task";
-	const agent = agents[key] ?? (key === "worker" ? agents.task : undefined);
+	const agent = Object.hasOwn(agents, key) ? agents[key] : key === "worker" ? agents.task : undefined;
 	if (!agent) {
 		throw new Error(`Unknown agent: ${key}. Available: ${Object.keys(agents).sort().join(", ")}`);
 	}
@@ -366,7 +375,7 @@ function thinkingFor(value: string | undefined): ThinkingLevel | undefined {
 	}
 }
 
-function modelEffort(spec: string | undefined): string | undefined {
+function modelEffort(spec: string | undefined): ThinkingLevel | undefined {
 	if (!spec) return undefined;
 	const colon = spec.lastIndexOf(":");
 	if (colon < 0) return undefined;
@@ -420,7 +429,8 @@ function formatResult(result: TaskResult): string {
 		result.text.length > 5000 && result.sessionFile
 			? `\n<full-transcript>${result.sessionFile}</full-transcript>`
 			: "";
-	return `<task-result id="${result.id}" agent="${result.agent}" status="${result.status}" duration="${Math.round(result.durationMs / 1000)}s">\n${body}${pointer}\n</task-result>`;
+	const warnings = result.warnings?.length ? `\n<warnings>\n${result.warnings.join("\n")}\n</warnings>` : "";
+	return `<task-result id="${result.id}" agent="${result.agent}" status="${result.status}" duration="${Math.round(result.durationMs / 1000)}s">\n${body}${warnings}${pointer}\n</task-result>`;
 }
 
 function readTail(file: string, bytes = 200_000): string {
@@ -442,6 +452,14 @@ function readTail(file: string, bytes = 200_000): string {
 
 function transcriptMessage(entry: any): any | undefined {
 	if (entry.type === "message") return entry.message;
+	if (entry.type === "compaction") return {
+		role: "compactionSummary", summary: entry.summary, tokensBefore: entry.tokensBefore,
+		timestamp: Date.parse(entry.timestamp) || 0,
+	};
+	if (entry.type === "branch_summary") return {
+		role: "branchSummary", summary: entry.summary, fromId: entry.fromId,
+		timestamp: Date.parse(entry.timestamp) || 0,
+	};
 	if (entry.type !== "custom_message" || entry.display === false) return undefined;
 	return {
 		role: "custom", customType: entry.customType, content: entry.content,
@@ -460,6 +478,8 @@ function transcriptText(file: string): string {
 			if (message?.role === "user") {
 				const text = textOf(message);
 				if (text) out.push(`USER:\n${text}`);
+			} else if (message?.role === "compactionSummary" || message?.role === "branchSummary") {
+				out.push(`${message.role === "compactionSummary" ? "COMPACTION" : "BRANCH SUMMARY"}:\n${message.summary ?? ""}`);
 			} else if (message?.role === "custom") {
 				const text = textOf(message);
 				if (text) out.push(`${message.customType}:\n${text}`);
@@ -863,8 +883,14 @@ async function showTranscript(ctx: ExtensionContext, id: string, task: TaskRecor
 	);
 }
 
+function isSafeSessionId(value: unknown): value is string {
+	return typeof value === "string" && /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/.test(value);
+}
+
 function sessionDir(ctx: ExtensionContext): string {
-	return join(getAgentDir(), "subagents", ctx.sessionManager.getSessionId());
+	const id = ctx.sessionManager.getSessionId();
+	if (!isSafeSessionId(id)) throw new Error("Invalid parent session id");
+	return join(getAgentDir(), "subagents", id);
 }
 
 function readHead(file: string, bytes = 65536): string {
@@ -878,8 +904,38 @@ function readHead(file: string, bytes = 65536): string {
 	}
 }
 
+function asString(value: unknown): string | undefined {
+	return typeof value === "string" ? value : undefined;
+}
+
+function readSavedSession(file: string, cwd: string, headOnly = false) {
+	const entries = parseSessionEntries(headOnly ? readHead(file) : readFileSync(file, "utf8"))
+		.filter((entry) => entry && typeof entry === "object" && !Array.isArray(entry));
+	if (!entries.some((entry) => entry.type === "session")) return undefined;
+	// Use Pi's canonical branch/migration logic without rewriting the source journal.
+	const session = SessionManager.inMemory(cwd, undefined, entries);
+	let meta: Record<string, unknown> | undefined;
+	let modelOverride: Record<string, unknown> | undefined;
+	const branch: SessionEntry[] = [];
+	const seen = new Set<string>();
+	for (let entry = session.getLeafEntry(); entry; entry = entry.parentId ? session.getEntry(entry.parentId) : undefined) {
+		if (seen.has(entry.id)) return undefined;
+		seen.add(entry.id);
+		branch.push(entry);
+	}
+	for (const entry of branch.reverse()) {
+		if (entry.type !== "custom" || !entry.data || typeof entry.data !== "object" || Array.isArray(entry.data)) continue;
+		if (entry.customType === "omp-subagent") meta = entry.data as Record<string, unknown>;
+		if (entry.customType === "omp-subagent-model" || (entry.customType === "omp-subagent-resume"
+			&& (Object.hasOwn(entry.data, "model") || Object.hasOwn(entry.data, "thinking")))) {
+			modelOverride = entry.data as Record<string, unknown>;
+		}
+	}
+	return meta ? { header: session.getHeader(), meta, modelOverride } : undefined;
+}
+
 function loadSaved(ctx: ExtensionContext, parentSessionId = ctx.sessionManager.getSessionId()): SavedTask[] {
-	if (!/^[\w-]+$/.test(parentSessionId)) return [];
+	if (!isSafeSessionId(parentSessionId)) return [];
 	const dir = join(getAgentDir(), "subagents", parentSessionId);
 	if (!existsSync(dir)) return [];
 	const saved: SavedTask[] = [];
@@ -892,56 +948,33 @@ function loadSaved(ctx: ExtensionContext, parentSessionId = ctx.sessionManager.g
 	for (const file of files) {
 		if (!file.endsWith(".jsonl")) continue;
 		const path = join(dir, file);
-		let header: any;
-		let meta: any;
-		let modelOverride: any;
+		let data: ReturnType<typeof readSavedSession>;
 		try {
-			for (const line of readTail(path, 256_000).split("\n")) {
-				if (!line.trim()) continue;
-				let entry: any;
-				try {
-					entry = JSON.parse(line);
-				} catch {
-					continue;
-				}
-				if (entry.type === "custom" && entry.customType === "omp-subagent-model") {
-					modelOverride = entry.data;
-				}
-			}
-			for (const line of readHead(path).split("\n").slice(0, 80)) {
-				if (!line.trim()) continue;
-				let entry: any;
-				try {
-					entry = JSON.parse(line);
-				} catch {
-					continue;
-				}
-				if (entry.type === "session") header = entry;
-				if (entry.type === "custom" && entry.customType === "omp-subagent") meta = entry.data;
-			}
+			data = readSavedSession(path, ctx.cwd);
 		} catch {
 			continue;
 		}
-		if (!meta) continue;
+		if (!data) continue;
+		const { header, meta, modelOverride } = data;
 		saved.push({
-			id: meta.id ?? header?.id ?? basename(file, ".jsonl"),
-			name: meta.name ?? meta.id ?? basename(file, ".jsonl"),
-			agent: meta.agent ?? "task",
-			task: meta.task ?? "",
-			context: meta.context ?? "",
-			modelSpec: modelOverride?.model ?? meta.model,
-			thinking: modelOverride?.thinking ?? meta.thinking,
+			id: asString(meta.id) ?? asString(header?.id) ?? basename(file, ".jsonl"),
+			name: asString(meta.name) ?? asString(meta.id) ?? basename(file, ".jsonl"),
+			agent: asString(meta.agent) ?? "task",
+			task: asString(meta.task) ?? "",
+			context: asString(meta.context) ?? "",
+			modelSpec: asString(modelOverride?.model) ?? asString(meta.model),
+			thinking: asString(modelOverride?.thinking) ?? asString(meta.thinking),
 			sessionFile: path,
 			createdAt: Number(meta.createdAt ?? Date.parse(header?.timestamp ?? "")) || 0,
 			status: "saved",
-			parentSessionFile: meta.parentSessionFile ?? null,
-			sessionId: typeof header?.id === "string" && /^[\w-]+$/.test(header.id) ? header.id : undefined,
+			parentSessionFile: asString(meta.parentSessionFile) ?? null,
+			sessionId: isSafeSessionId(header?.id) ? header.id : undefined,
 		});
 	}
 	return saved.sort((a, b) => b.createdAt - a.createdAt);
 }
 
-function cleanOrphans(): void {
+function cleanOrphans(protectedIds: ReadonlySet<string> = new Set()): void {
 	if (CONFIG.autoCleanOrphans === false) return;
 	const root = join(getAgentDir(), "subagents");
 	if (!existsSync(root)) return;
@@ -952,6 +985,7 @@ function cleanOrphans(): void {
 		return;
 	}
 	for (const name of dirs) {
+		if (protectedIds.has(name)) continue;
 		const dir = join(root, name);
 		try {
 			if (!statSync(dir).isDirectory()) continue;
@@ -967,18 +1001,10 @@ function cleanOrphans(): void {
 		let parentFile: string | null | undefined;
 		for (const file of files) {
 			try {
-				for (const line of readHead(join(dir, file)).split("\n").slice(0, 80)) {
-					if (!line.trim()) continue;
-					let entry: any;
-					try {
-						entry = JSON.parse(line);
-					} catch {
-						continue;
-					}
-					if (entry.type === "custom" && entry.customType === "omp-subagent") {
-						parentFile = entry.data?.parentSessionFile;
-						break;
-					}
+				const path = join(dir, file);
+				const data = readSavedSession(path, getAgentDir(), true) ?? readSavedSession(path, getAgentDir());
+				if (data && Object.hasOwn(data.meta, "parentSessionFile")) {
+					parentFile = asString(data.meta.parentSessionFile) ?? null;
 				}
 			} catch {
 				// Ignore unreadable child sessions.
@@ -995,9 +1021,13 @@ function cleanOrphans(): void {
 	}
 }
 
-function persistModelSelection(file: string, cwd: string, modelSpec: string | undefined, thinking: string | undefined): void {
-	if (!file || !existsSync(file)) return;
-	const manager = SessionManager.open(file, dirname(file), cwd);
+function persistModelSelection(file: string | undefined, cwd: string, modelSpec: string | undefined,
+	thinking: string | undefined, liveManager?: SessionManager): void {
+	let manager = liveManager;
+	if (!manager) {
+		if (!file || !existsSync(file)) return;
+		manager = SessionManager.open(file, dirname(file), cwd);
+	}
 	manager.appendCustomEntry("omp-subagent-model", {
 		model: modelSpec,
 		thinking,
@@ -1144,6 +1174,7 @@ class SubagentManager {
 
 	async start(ctx: ExtensionContext, context: string, tasks: TaskInput[]): Promise<TaskRecord[]> {
 		if (this.closed) throw new Error("Session closed");
+		sessionDir(ctx); // Reject unsafe parent IDs before scheduling any work.
 		const agents = loadAgents(ctx);
 		const prepared = tasks.map((input) => {
 			const agentDef = resolveAgent(agents, input.agent);
@@ -1198,8 +1229,9 @@ class SubagentManager {
 		thinking?: string,
 	): Promise<TaskRecord> {
 		if (this.closed) throw new Error("Session closed");
+		sessionDir(ctx);
 		const active = this.tasks.get(id);
-		if (active && !active.finished) {
+		if (active && (!active.finished || active.selectionUpdate)) {
 			throw new Error(`Subagent ${id} is still running or stopping`);
 		}
 		const saved = loadSaved(ctx).find((item) => item.id === id);
@@ -1298,6 +1330,7 @@ class SubagentManager {
 			const dir = sessionDir(ctx);
 			mkdirSync(dir, { recursive: true });
 			const sessionManager = existingSessionManager ?? SessionManager.create(ctx.cwd, dir);
+			record.sessionManager = sessionManager;
 			record.sessionId = sessionManager.getSessionId();
 			record.sessionFile = sessionManager.getSessionFile() ?? record.sessionFile;
 			if (!existingSessionManager) {
@@ -1318,6 +1351,8 @@ class SubagentManager {
 				sessionManager.appendCustomEntry("omp-subagent-resume", {
 					version: 1,
 					id: record.id,
+					model: record.modelSpec,
+					thinking: record.thinking,
 					task: record.task,
 					createdAt: record.startedAt,
 				});
@@ -1353,9 +1388,14 @@ class SubagentManager {
 				systemPrompt: agentDef.prompt,
 			});
 			await loader.reload();
+			for (const error of loader.getExtensions().errors) {
+				this.noteExtensionWarning(record, error.path, error.error);
+			}
 			const modelRuntime = await this.childRuntime(ctx);
-			const model = resolveModel(ctx, record.modelSpec);
-			const thinkingLevel = thinkingFor(record.thinking) ?? ctx.thinkingLevel;
+			const creationModelSpec = record.modelSpec;
+			const creationThinking = record.thinking;
+			const model = resolveModel(ctx, creationModelSpec);
+			const thinkingLevel = thinkingFor(creationThinking) ?? ctx.thinkingLevel;
 			if (this.closed || record.finished || record.stopRequested) {
 				throw new Error("Stopped by user");
 			}
@@ -1373,14 +1413,14 @@ class SubagentManager {
 			record.child = child;
 			if (this.closed || record.stopRequested) throw new Error("Stopped by user");
 			record.toolDefinitions = new Map(
-				child.getAllTools().map((tool: any) => [tool.name, child.getToolDefinition(tool.name)]),
+				child.getAllTools().map((tool) => [tool.name, child.getToolDefinition(tool.name)]),
 			);
 			record.resolvedModel = child.model ? `${child.model.provider}/${child.model.id}` : record.modelSpec;
 			record.resolvedThinking = child.thinkingLevel ?? thinkingLevel;
 			record.sessionFile = child.sessionManager.getSessionFile() ?? record.sessionFile;
 			this.renderWidget();
-			let lastAssistant: any;
-			record.unsubscribe = child.subscribe((event: any) => {
+			let lastAssistant: AssistantMessage | undefined;
+			record.unsubscribe = child.subscribe((event) => {
 				if (event?.type === "message_end" && event.message?.role === "assistant") {
 					lastAssistant = event.message;
 				}
@@ -1390,7 +1430,20 @@ class SubagentManager {
 					this.renderWidget();
 				}
 			});
-			await child.bindExtensions({ mode: "print" });
+			await child.bindExtensions({
+				mode: "print",
+				onError: (error: { extensionPath: string; error: string }) =>
+					this.noteExtensionWarning(record, error.extensionPath, error.error),
+			});
+			await this.waitForSelection(record);
+			if (record.modelSpec !== creationModelSpec || record.thinking !== creationThinking) {
+				const selected = resolveModel(ctx, record.modelSpec);
+				const effort = thinkingFor(record.thinking) ?? ctx.thinkingLevel;
+				if (child.model?.provider !== selected?.provider || child.model?.id !== selected?.id || child.thinkingLevel !== effort) {
+					await this.switchModel(ctx, record.id, record.modelSpec, effort);
+				}
+			}
+			await this.waitForSelection(record);
 			if (this.closed || record.finished || record.stopRequested) {
 				throw new Error("Stopped by user");
 			}
@@ -1447,20 +1500,30 @@ class SubagentManager {
 				clearTimeout(record.stopTimer);
 				record.stopTimer = undefined;
 			}
+			await this.waitForSelection(record);
 			try {
 				record.unsubscribe?.();
 			} catch {
 				// Best effort.
 			}
 			await this.closeChild(record);
+			await this.waitForSelection(record);
 			record.endedAt = Date.now();
 			record.finished = true;
 			// Capacity belongs to the actual run, not to an early stop notification.
 			this.tree.release(record);
 			if (!record.finalized) this.deliver(record);
 			this.settleWaiters();
+			this.signalActivity();
+			record.sessionManager = undefined;
 			this.renderWidget();
 		}
+	}
+
+	private noteExtensionWarning(record: TaskRecord, source: string, error: string): void {
+		const warning = `${source}: ${error}`;
+		const warnings = record.extensionWarnings ??= [];
+		if (!warnings.includes(warning)) warnings.push(warning);
 	}
 
 	private closeChild(record: TaskRecord): Promise<void> {
@@ -1513,6 +1576,7 @@ class SubagentManager {
 			sessionFile: record.sessionFile,
 			error: record.error,
 			durationMs: (record.endedAt ?? Date.now()) - record.startedAt,
+			...(record.extensionWarnings?.length ? { warnings: [...record.extensionWarnings] } : {}),
 		};
 		this.renderWidget();
 		const waiter = this.waiters.shift();
@@ -1658,7 +1722,16 @@ class SubagentManager {
 		});
 	}
 
+	private async waitForSelection(record: TaskRecord): Promise<void> {
+		while (record.selectionUpdate) {
+			const update = record.selectionUpdate;
+			try { await update; } catch { /* The control caller receives the failure. */ }
+			if (record.selectionUpdate === update) break;
+		}
+	}
+
 	private missingTask(ctx: ExtensionContext, id: string): Error {
+		if (this.tasks.has(id)) return new Error(`Subagent ${id} has no saved session to resume`);
 		return new Error(this.treeRows(ctx).some(({ record }) => record.id === id)
 			? `Subagent ${id} belongs to a nested session; control it through its direct parent`
 			: `Unknown subagent: ${id}`);
@@ -1673,33 +1746,41 @@ class SubagentManager {
 		if (this.closed) throw new Error("Session closed");
 		const model = modelSpec ? resolveModel(ctx, modelSpec) : undefined;
 		const active = this.tasks.get(id);
-		const saved = active ? undefined : loadSaved(ctx).find((item) => item.id === id);
-		const record = active ?? saved;
-		if (!record) throw this.missingTask(ctx, id);
-		const nextModel = modelSpec ?? record.modelSpec;
-		const nextThinking = thinking ?? modelEffort(modelSpec) ?? record.thinking ?? modelEffort(nextModel);
-		if (active?.status === "running" && active.child) {
-			if (model) await active.child.setModel(model);
-			if (nextThinking) active.child.setThinkingLevel(nextThinking);
-			active.modelSpec = nextModel;
-			active.thinking = nextThinking;
-			active.resolvedModel = active.child.model
-				? `${active.child.model.provider}/${active.child.model.id}`
-				: nextModel;
-			active.resolvedThinking = active.child.thinkingLevel ?? nextThinking;
-			persistModelSelection(active.sessionFile, ctx.cwd, active.modelSpec, active.thinking);
-			return active;
-		}
 		if (active) {
-			active.modelSpec = nextModel;
-			active.thinking = nextThinking;
-			active.resolvedModel = nextModel;
-			active.resolvedThinking = nextThinking;
-			persistModelSelection(active.sessionFile, ctx.cwd, nextModel, nextThinking);
-			return active;
+			const previous = active.selectionUpdate;
+			const update = (async () => {
+				try { await previous; } catch { /* A failed update does not poison later controls. */ }
+				if (this.closed) throw new Error("Session closed");
+				const nextModel = modelSpec ?? active.modelSpec;
+				const nextThinking = thinkingFor(thinking) ?? modelEffort(modelSpec) ?? thinkingFor(active.thinking) ?? modelEffort(nextModel);
+				if (active.status === "running" && active.child) {
+					if (model) await active.child.setModel(model);
+					if (nextThinking) active.child.setThinkingLevel(nextThinking);
+					active.resolvedModel = active.child.model ? `${active.child.model.provider}/${active.child.model.id}` : nextModel;
+					active.resolvedThinking = active.child.thinkingLevel ?? nextThinking;
+				} else {
+					active.resolvedModel = nextModel;
+					active.resolvedThinking = nextThinking;
+				}
+				active.modelSpec = nextModel;
+				active.thinking = nextThinking;
+				persistModelSelection(active.sessionFile, ctx.cwd, nextModel, nextThinking,
+					active.finished ? undefined : active.sessionManager);
+			})();
+			active.selectionUpdate = update;
+			try {
+				await update;
+				return active;
+			} finally {
+				if (active.selectionUpdate === update) active.selectionUpdate = undefined;
+			}
 		}
-		persistModelSelection(saved!.sessionFile, ctx.cwd, nextModel, nextThinking);
-		return { ...saved!, modelSpec: nextModel, thinking: nextThinking };
+		const saved = loadSaved(ctx).find((item) => item.id === id);
+		if (!saved) throw this.missingTask(ctx, id);
+		const nextModel = modelSpec ?? saved.modelSpec;
+		const nextThinking = thinkingFor(thinking) ?? modelEffort(modelSpec) ?? thinkingFor(saved.thinking) ?? modelEffort(nextModel);
+		persistModelSelection(saved.sessionFile, ctx.cwd, nextModel, nextThinking);
+		return { ...saved, modelSpec: nextModel, thinking: nextThinking };
 	}
 
 	async message(
@@ -1806,7 +1887,7 @@ class SubagentManager {
 	hasLive(): boolean {
 		return [...this.tasks.values()].some(
 			(record) =>
-				!record.finished ||
+				!record.finished || !!record.selectionUpdate ||
 				record.status === "queued" ||
 				record.status === "running",
 		);
@@ -1814,7 +1895,7 @@ class SubagentManager {
 
 	clearFinished(): void {
 		for (const [id, record] of this.tasks) {
-			if (record.finished && record.finalized) this.tasks.delete(id);
+			if (record.finished && record.finalized && !record.selectionUpdate) this.tasks.delete(id);
 		}
 	}
 
@@ -1842,23 +1923,33 @@ class SubagentManager {
 
 	cleanSaved(ctx: ExtensionContext): void {
 		if (this.hasLive()) throw new Error("Stop active subagents before cleaning saved sessions");
+		sessionDir(ctx);
 		const ids = new Set(this.treeRows(ctx).map(({ record }) => record.sessionId).filter((id): id is string => !!id));
 		ids.add(ctx.sessionManager.getSessionId());
 		for (const id of ids) {
-			if (/^[\w-]+$/.test(id)) rmSync(join(getAgentDir(), "subagents", id), { recursive: true, force: true });
+			if (isSafeSessionId(id)) rmSync(join(getAgentDir(), "subagents", id), { recursive: true, force: true });
 		}
 		this.clearFinished();
 	}
 
+	pruneOrphans(ctx: ExtensionContext): void {
+		if (CONFIG.autoCleanOrphans === false) return;
+		const protectedIds = new Set<string>([ctx.sessionManager.getSessionId()]);
+		for (const { record } of this.treeRows(ctx, false)) {
+			if (record.sessionId) protectedIds.add(record.sessionId);
+		}
+		cleanOrphans(protectedIds);
+	}
+
 	async listAll(ctx: ExtensionContext): Promise<Array<TaskRecord | SavedTask>> {
-		cleanOrphans();
+		this.pruneOrphans(ctx);
 		const active = this.list();
 		const saved = loadSaved(ctx).filter((item) => !this.tasks.has(item.id));
 		return [...active, ...saved];
 	}
 
 	async getAny(ctx: ExtensionContext, id: string): Promise<TaskRecord | SavedTask | undefined> {
-		cleanOrphans();
+		this.pruneOrphans(ctx);
 		return this.tasks.get(id) ?? this.treeRows(ctx).find(({ record }) => record.id === id)?.record;
 	}
 
@@ -1919,8 +2010,8 @@ export default function subagents(pi: ExtensionAPI, tree?: TaskTree, host?: Task
 	};
 
 	pi.on("session_start", (_event, ctx) => {
-		if (!host) cleanOrphans();
-		getManager(ctx);
+		const current = getManager(ctx);
+		if (!host) current.pruneOrphans(ctx);
 	});
 
 	pi.on("session_shutdown", async () => {
@@ -2081,7 +2172,7 @@ export default function subagents(pi: ExtensionAPI, tree?: TaskTree, host?: Task
 				}
 				return;
 			}
-			cleanOrphans();
+			mgr.pruneOrphans(ctx);
 			const rows = mgr.treeRows(ctx);
 			if (rows.length === 0) {
 				ctx.ui.notify("No subagents in this session.", "info");

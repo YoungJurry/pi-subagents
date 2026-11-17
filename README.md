@@ -101,7 +101,11 @@ No environment variables are used. Reload/restart after changing the file.
 - Built-in roles: `task` (general-purpose execution), `scout` (read-only
   investigation), and `review` (read-only review). `worker` aliases `task`,
   unless a custom agent overrides that name.
-- Custom agents load from `~/.pi/agent/agents/*.md` and `.pi/agents/*.md`.
+- Custom agents load from `~/.pi/agent/agents/*.md` and trusted-project
+  `.pi/agents/*.md`; untrusted project definitions cannot override role prompts.
+  Optional frontmatter `model`, `thinking`, and `tools` accept null-like values
+  as unset. An explicit `tools: []` selects no tools; listed names are preserved
+  exactly, so selecting search tools never silently grants `bash` access.
 - At most 8 tasks per call.
 - Completed results auto-deliver in small batches without waiting for unrelated
   children. Use `wait` when blocked instead of polling.
@@ -132,7 +136,9 @@ At least one of `message`, `model`, or `thinking` is required.
 - Queued/starting target: the message is delivered with the start; the new
   model/thinking is used when it starts.
 - Finished/saved target: `message` resumes the same session as a follow-up task.
-- Only `model`/`thinking`: switch without starting a new turn.
+- Only `model`/`thinking`: switch without starting a new turn. Updates for the
+  same child are serialized; startup and cleanup wait for pending updates so
+  the live model, thinking level, and saved selection stay consistent.
 - Results still arrive through `wait` or auto-delivery.
 - A stopped child cannot resume until its previous execution has finished
   cleaning up, so two runs never write to the same transcript concurrently.
@@ -143,7 +149,8 @@ tools. It is not OMP's `agent://` / `proc://` URI system.
 ## Child sessions
 
 - Fresh context by default; no parent chat history.
-- Child cwd is the parent cwd.
+- Child cwd is the parent cwd. Session IDs follow Pi's validation rules,
+  including dotted IDs, and cannot escape the subagent session directory.
 - Child settings inherit the parent working directory and global/project
   settings, including `shellCommandPrefix`.
 - Child model precedence:
@@ -151,6 +158,9 @@ tools. It is not OMP's `agent://` / `proc://` URI system.
 - Child thinking precedence:
   per-task `thinking` or `model:thinking` → custom-agent frontmatter → selected
   default model's thinking suffix → parent.
+- Extension loading/startup/runtime errors are returned as deduplicated warnings
+  with the result instead of disappearing in a headless child. Nonfatal optional
+  extension errors do not automatically fail otherwise successful work.
 - Each child independently loads configured global/trusted-project extensions
   and the standard codemode, tool-search, and MCP builtins. Project trust is
   inherited; disabled builtins stay disabled. Parent-bound tool instances and
@@ -175,9 +185,15 @@ tools. It is not OMP's `agent://` / `proc://` URI system.
 ```
 
 New child metadata records `parentSessionId` and `parentSessionFile`. On
-`session_start` and `/subagents` listing, child groups whose parent file no
-longer exists are removed. Old sessions without `parentSessionFile` are left
-untouched.
+`session_start` and `/subagents` listing, orphaned child groups whose parent file
+no longer exists are removed. The currently open parent and live descendant
+groups are protected, including when a parent file moves. Old sessions without
+`parentSessionFile` are left untouched.
+
+Saved metadata and model/thinking selections follow the active journal branch;
+large shared contexts or later output cannot hide them behind a fixed byte
+window. Reading history uses Pi's in-memory migration logic without rewriting
+journals, and cyclic parent links are ignored safely.
 
 ### Built-in role instructions
 
@@ -248,6 +264,9 @@ Actual totals depend on cwd/date, provider serialization, and other tools.
 - No detached runner across Pi exit/reload.
 - Extension loading has per-session overhead (including separate MCP
   connections), and arbitrary extensions may have their own background behavior.
+- Configured extensions can recreate model routes/credentials in a child, but
+  virtual models or credentials registered only in the parent's temporary
+  runtime are not guaranteed to be inherited through the public SDK.
 - Delegation has no depth cap; the shared concurrency budget limits simultaneous
   execution, not total work or cumulative token usage.
 - `scout`/`review` read-only is prompt-level, not a sandbox.
@@ -255,7 +274,8 @@ Actual totals depend on cwd/date, provider serialization, and other tools.
 - No child token/cost accounting.
 - `wait` has no timeout. A forced stop reports when cleanup is still pending;
   an uncooperative tool keeps its execution slot and transcript locked until it
-  actually settles. The plugin does not fake termination or reuse a busy session.
+  actually settles. The plugin does not fake termination or reuse a busy session;
+  orderly reload/shutdown also waits for cleanup.
 - Viewer live refresh shows persisted messages; streaming partial output is not
   yet integrated.
 
@@ -272,11 +292,14 @@ compiler dependency. Runtime still uses the same three tools and only the
 `session_start` / `session_shutdown` hooks. A regression test freezes the tool
 schemas and descriptions byte-for-byte.
 
-With the Pi 1.5.2+ peer packages available, also run `npm run test:sdk` for the
-real-SDK offline integration checks. A simulated provider and temporary web
+With the Pi 1.5.2+ peer packages available, run `npm run typecheck` (including
+unused-code checks) and `npm run test:sdk` for the real-SDK offline integration checks. A simulated provider and temporary web
 extension exercise nested delegation, codemode tool calls, session isolation,
-shutdown, and idle-parent wakeups at a concurrency of one. All fixtures stay in
-`/tmp`; no real model requests or user credentials are used.
+shutdown, and idle-parent wakeups at a concurrency of one. It also verifies a
+child default model/thinking distinct from the parent's, trusted role loading,
+and model-switch/resume persistence after large contexts and transcript output.
+Tool results are checked structurally, including child extension warnings.
+All fixtures stay in `/tmp`; no real model requests or user credentials are used.
 
 ## License
 
