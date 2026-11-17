@@ -99,8 +99,8 @@ No environment variables are used. Reload/restart after changing the file.
 - `context` is written once per `task` call; every child receives it.
 - Default agent is `task`.
 - Built-in roles: `task` (general-purpose execution), `scout` (read-only
-  investigation), and `review` (read-only review). `general` and `worker` are
-  compatibility aliases for `task`, unless a custom agent overrides that name.
+  investigation), and `review` (read-only review). `worker` aliases `task`,
+  unless a custom agent overrides that name.
 - Custom agents load from `~/.pi/agent/agents/*.md` and `.pi/agents/*.md`.
 - At most 8 tasks per call.
 - Completed results auto-deliver in small batches without waiting for unrelated
