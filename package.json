@@ -57,7 +57,8 @@
   },
   "scripts": {
     "test": "node --experimental-vm-modules --test test/*.test.mjs",
-    "test:sdk": "node test/sdk-smoke.mjs wait && node test/sdk-smoke.mjs idle"
+    "test:sdk": "node test/sdk-smoke.mjs wait && node test/sdk-smoke.mjs idle",
+    "typecheck": "tsc --noEmit --target es2022 --module nodenext --moduleResolution nodenext --skipLibCheck --noUnusedLocals --noUnusedParameters index.ts"
   },
   "devDependencies": {
     "@types/node": "^26.6.6",

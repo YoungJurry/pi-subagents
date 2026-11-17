@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { appendFileSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import ts from "typescript";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -11,7 +11,7 @@ import vm from "node:vm";
 const source = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
 const js = ts.transpileModule(source, {
     compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
-}).outputText + "\nexport { SubagentManager, TaskTree, loadAgents, resolveAgent, SUBAGENT_PREAMBLE, parseFrontmatter, formatResult, agentListLabel, transcriptText, buildSnapshot };\n";
+}).outputText + "\nexport { SubagentManager, TaskTree, loadAgents, resolveAgent, SUBAGENT_PREAMBLE, parseFrontmatter, formatResult, agentListLabel, transcriptText, buildSnapshot, isSafeSessionId };\n";
 const deferred = () => {
     let resolve;
     const promise = new Promise((done) => { resolve = done; });
@@ -51,16 +51,42 @@ async function fixture(t, options = {}) {
             this.entries = [];
             this.id = `child-${nextFile}`;
             mkdirSync(dirname(file), { recursive: true });
-            writeFileSync(file, JSON.stringify({ type: "session", id: this.id, timestamp: new Date().toISOString() }) + "\n");
+            this.header = { type: "session", version: 3, id: this.id, timestamp: new Date().toISOString() };
+            if (!options.deferSessionFile) this.flush();
             sessions.set(file, this);
+        }
+        flush() {
+            if (!existsSync(this.file)) writeFileSync(this.file, [this.header, ...this.entries].map((entry) => JSON.stringify(entry)).join("\n") + "\n");
         }
         getSessionFile() { return this.file; }
         getSessionId() { return this.id; }
         getBranch() { return this.entries; }
         appendCustomEntry(customType, data) {
-            const entry = { type: "custom", customType, data };
+            const entry = { type: "custom", id: `entry-${this.entries.length + 1}`, parentId: this.entries.at(-1)?.id ?? null, customType, data };
             this.entries.push(entry);
-            appendFileSync(this.file, JSON.stringify(entry) + "\n");
+            if (existsSync(this.file)) appendFileSync(this.file, JSON.stringify(entry) + "\n");
+        }
+        static inMemory(_cwd, _options, entries) {
+            const header = entries.find((entry) => entry.type === "session");
+            const items = entries.filter((entry) => entry.type !== "session");
+            let branch = items;
+            if (items.length > 0 && items.every((entry) => typeof entry.id === "string")) {
+                branch = [];
+                const byId = new Map(items.map((entry) => [entry.id, entry]));
+                const seen = new Set();
+                let current = items.at(-1);
+                while (current && !seen.has(current.id)) {
+                    seen.add(current.id);
+                    branch.unshift(current);
+                    current = byId.get(current.parentId);
+                }
+            }
+            return {
+                getHeader: () => header,
+                getBranch: () => branch,
+                getLeafEntry: () => items.at(-1),
+                getEntry: (id) => items.find((entry) => entry.id === id),
+            };
         }
         static create(_cwd, dir) { return new Session(join(dir, `${++nextFile}.jsonl`)); }
         static open(file) { return sessions.get(file); }
@@ -95,6 +121,7 @@ async function fixture(t, options = {}) {
     };
     const fakePi = {
         getAgentDir: () => root,
+        parseSessionEntries: (content) => content.trim().split("\n").flatMap((line) => { try { return [JSON.parse(line)]; } catch { return []; } }),
         SessionManager: Session,
         SettingsManager: { create: (_cwd, _agentDir, settingsOptions) => ({ settingsOptions }) },
         createCodemodeExtension: () => () => {},
@@ -102,6 +129,7 @@ async function fixture(t, options = {}) {
         createToolSearchExtension: () => () => {},
         DefaultResourceLoader: class {
             constructor(options) { this.options = options; this.tools = []; this.hooks = new Map(); }
+            getExtensions() { return this.loaded; }
             async reload() {
                 const extension = { tools: new Map(), commands: new Map() };
                 const api = {
@@ -118,13 +146,13 @@ async function fixture(t, options = {}) {
                 for (const input of this.options.extensionFactories ?? []) input.factory?.(api);
                 const discovered = { path: "installed-subagents", commands: new Map([["subagents", {}]]), tools: new Map(tools.map((tool) => [tool.name, { definition: { ...tool, description: "An older plugin description" } }])) };
                 const web = { path: "web-tools", tools: new Map(["web_search", "fetch", "codemode"].map((name) => [name, { definition: { name } }])) };
-                this.loaded = this.options.extensionsOverride?.({ extensions: [discovered, web, extension], errors: [], runtime: {} });
+                this.loaded = this.options.extensionsOverride?.({ extensions: [discovered, web, extension], errors: options.extensionLoadError ? [{ path: "broken-extension", error: options.extensionLoadError }] : [], runtime: {} });
             }
         },
         ModelRuntime: { create: async () => ({}) },
         createAgentSession: async ({ sessionManager, model, thinkingLevel, resourceLoader, tools: selectedTools }) => {
             const behavior = behaviors.shift() ?? {};
-            for (const gate of [behavior.gate, behavior.creationGate]) if (gate) startedGates.push(gate);
+            for (const gate of [behavior.gate, behavior.creationGate, behavior.bindGate, behavior.setterGate]) if (gate) startedGates.push(gate);
             const listeners = new Set();
             const abortController = new AbortController();
             const child = {
@@ -157,13 +185,20 @@ async function fixture(t, options = {}) {
                 getAllTools: () => (resourceLoader.loaded?.extensions ?? []).flatMap((extension) => [...extension.tools.values()].map((tool) => tool.definition)),
                 getToolDefinition: (name) => (resourceLoader.loaded?.extensions ?? []).flatMap((extension) => [...extension.tools.values()]).find((tool) => tool.definition.name === name)?.definition,
                 subscribe: (listener) => { listeners.add(listener); return () => listeners.delete(listener); },
-                bindExtensions: async () => resourceLoader.hooks.get("session_start")?.({ type: "session_start" }, child.ctx),
+                bindExtensions: async (bindings) => {
+                    await resourceLoader.hooks.get("session_start")?.({ type: "session_start" }, child.ctx);
+                    if (behavior.extensionError) {
+                        for (let n = 0; n < 2; n++) bindings.onError?.({ extensionPath: "runtime-extension", error: behavior.extensionError });
+                    }
+                    if (behavior.bindGate) await behavior.bindGate.promise;
+                },
                 dispose() { this.disposed = true; },
                 abort() { this.aborted = true; abortController.abort(); },
                 async setModel(next) { this.model = next; },
                 setThinkingLevel(next) { this.thinkingLevel = next; },
                 async steer(text) { this.steered = text; },
                 async prompt(text) {
+                    sessionManager.flush();
                     this.promptText = text;
                     this.turns++;
                     this.messages.push({ role: "user", content: text });
@@ -232,7 +267,7 @@ async function fixture(t, options = {}) {
     manager.setContext(ctx);
     t.after(async () => {
         for (const gate of startedGates) gate.resolve();
-        for (const behavior of behaviors) { behavior.gate?.resolve(); behavior.creationGate?.resolve(); }
+        for (const behavior of behaviors) { behavior.gate?.resolve(); behavior.creationGate?.resolve(); behavior.bindGate?.resolve(); }
         manager.shutdown();
         await rootHandlers.get("session_shutdown")?.();
         await manager.settled();
@@ -254,7 +289,7 @@ async function fixture(t, options = {}) {
 }
 
 test("tool schemas/descriptions stay byte-identical; only the original two hooks", async (t) => {
-    const contract = source.slice(source.indexOf("const TASK_DESCRIPTION"), source.indexOf("const PI_TOOLS"));
+    const contract = source.slice(source.indexOf("const TASK_DESCRIPTION"), source.indexOf("function parseList"));
     assert.equal(createHash("sha256").update(contract).digest("hex"), "be22467f497f4432a73876d61dcd9bcaa2f701b5c986f5e523924f4e9bde6417");
     const f = await fixture(t);
     assert.deepEqual(f.hooks, ["session_start", "session_shutdown"]);
@@ -1144,6 +1179,367 @@ test("nested follow-ups stay parent-scoped and explain how to address saved desc
     const descendant = f.manager.treeRows(f.ctx)[1].record;
     await assert.rejects(f.manager.resume(f.ctx, descendant.id, "continue"), /control it through its direct parent/);
     await assert.rejects(f.manager.switchOnly(f.ctx, descendant.id, "test/other"), /control it through its direct parent/);
+});
+
+test("untrusted project role files cannot override global or built-in instructions", async (t) => {
+    const f = await fixture(t, { trusted: false });
+    mkdirSync(join(f.root, ".pi", "agents"), { recursive: true });
+    writeFileSync(join(f.root, ".pi", "agents", "scout.md"), "---\nmodel: test/project\n---\nUntrusted project instructions.");
+    const [record] = await f.start([{ task: "inspect", agent: "scout" }]);
+    await until(() => record.finished);
+    assert.equal(f.children[0].model.id, "model");
+    assert.ok(f.children[0].resourceOptions.systemPrompt.includes("只读调查员"));
+});
+
+test("trusted project role files still override global definitions", async (t) => {
+    const f = await fixture(t, { trusted: true });
+    mkdirSync(join(f.root, "agents"));
+    mkdirSync(join(f.root, ".pi", "agents"), { recursive: true });
+    writeFileSync(join(f.root, "agents", "special.md"), "Global role instructions.");
+    writeFileSync(join(f.root, ".pi", "agents", "special.md"), "Project role instructions.");
+    const [record] = await f.start([{ task: "inspect", agent: "special" }]);
+    await until(() => record.finished);
+    assert.equal(f.children[0].resourceOptions.systemPrompt, "Project role instructions.");
+});
+
+test("inherited Object prototype names are not built-in agent definitions", async (t) => {
+    const f = await fixture(t);
+    const agents = f.exports.loadAgents(f.ctx);
+    for (const name of ["constructor", "toString", "__proto__"]) {
+        assert.throws(() => f.exports.resolveAgent(agents, name), /Unknown agent/);
+    }
+});
+
+test("large shared contexts do not hide saved children or prevent resume", async (t) => {
+    const f = await fixture(t);
+    const context = "大型共享上下文".repeat(18000);
+    const [record] = await f.manager.start(f.ctx, context, [{ task: "inspect" }]);
+    await until(() => record.finished);
+    const restored = new f.exports.SubagentManager({ sendMessage() {} });
+    restored.setContext(f.ctx);
+    t.after(async () => { restored.shutdown(); await restored.settled(); });
+    const saved = await restored.listAll(f.ctx);
+    assert.equal(saved.length, 1);
+    assert.equal(saved[0].context, context);
+    const resumed = await restored.resume(f.ctx, record.id, "continue");
+    await until(() => resumed.finished);
+    assert.equal(resumed.status, "completed", resumed.error);
+});
+
+test("saved model selection survives more than a tail window of later output", async (t) => {
+    const f = await fixture(t);
+    const [record] = await f.start([{ task: "inspect", model: "test/original:low" }]);
+    await until(() => record.finished);
+    await f.manager.switchOnly(f.ctx, record.id, "test/selected:high");
+    const last = JSON.parse(readFileSync(record.sessionFile, "utf8").trim().split("\n").at(-1));
+    appendFileSync(record.sessionFile, JSON.stringify({ type: "message", id: "large-output", parentId: last.id, message: { role: "assistant", content: [{ type: "text", text: "长输出".repeat(100000) }] } }) + "\n");
+    const restored = new f.exports.SubagentManager({ sendMessage() {} });
+    restored.setContext(f.ctx);
+    t.after(async () => { restored.shutdown(); await restored.settled(); });
+    const resumed = await restored.resume(f.ctx, record.id, "continue");
+    await until(() => resumed.finished);
+    assert.equal(f.children[1].model.id, "selected");
+    assert.equal(f.children[1].thinkingLevel, "high");
+});
+
+test("session id validation matches Pi without allowing path traversal", async (t) => {
+    const f = await fixture(t);
+    for (const id of ["my.project", "abc_123", "a-b", "a..b", "A1"]) assert.equal(f.exports.isSafeSessionId(id), true);
+    for (const id of ["", ".", "..", "../escape", "/tmp/escape", "a/b", "a\\b", "_leading", "trailing-", 42]) assert.equal(f.exports.isSafeSessionId(id), false);
+    f.ctx.sessionManager.getSessionId = () => "../../escape";
+    await assert.rejects(f.start([{ task: "must not run" }]), /Invalid parent session id/);
+    assert.equal(f.manager.list().length, 0);
+    assert.equal(f.children.length, 0);
+});
+
+test("dotted parent session ids support history, resume and recursive clean", async (t) => {
+    const f = await fixture(t);
+    f.ctx.sessionManager.getSessionId = () => "my.project";
+    const [record] = await f.start([{ task: "inspect" }]);
+    await until(() => record.finished);
+    const restored = new f.exports.SubagentManager({ sendMessage() {} });
+    restored.setContext(f.ctx);
+    t.after(async () => { restored.shutdown(); await restored.settled(); });
+    assert.equal((await restored.listAll(f.ctx)).length, 1);
+    const resumed = await restored.resume(f.ctx, record.id, "continue");
+    await until(() => resumed.finished);
+    restored.cleanSaved(f.ctx);
+    assert.equal(existsSync(record.sessionFile), false);
+});
+
+test("compaction and branch summaries are visible in both transcript views", async (t) => {
+    const f = await fixture(t);
+    const [record] = await f.start([{ task: "inspect" }]);
+    await until(() => record.finished);
+    for (const entry of [
+        { type: "compaction", summary: "preserved compacted context", tokensBefore: 5000 },
+        { type: "branch_summary", summary: "preserved branch context", fromId: "older-branch" },
+    ]) appendFileSync(record.sessionFile, JSON.stringify({ ...entry, timestamp: new Date().toISOString() }) + "\n");
+    const roles = Array.from(f.exports.buildSnapshot(record, f.ctx.cwd).messages.map((message) => message.role));
+    assert.deepEqual(roles, ["compactionSummary", "branchSummary"]);
+    const text = f.exports.transcriptText(record.sessionFile);
+    assert.ok(text.includes("preserved compacted context"));
+    assert.ok(text.includes("preserved branch context"));
+});
+
+for (const value of ["null", "~", "undefined"]) {
+    test(`optional frontmatter ${value} does not override the configured default model`, async (t) => {
+        const f = await fixture(t, { config: { defaultModel: "test/default:low" } });
+        mkdirSync(join(f.root, "agents"));
+        writeFileSync(join(f.root, "agents", "optional.md"), `---\nmodel: ${value}\nthinking: ${value}\ntools: ${value}\n---\nInspect.`);
+        const [record] = await f.start([{ task: "inspect", agent: "optional" }]);
+        await until(() => record.finished);
+        assert.equal(record.status, "completed", record.error);
+        assert.equal(f.children[0].model.id, "default");
+        assert.equal(f.children[0].thinkingLevel, "low");
+        assert.equal(f.children[0].selectedTools, undefined);
+    });
+}
+
+test("an explicitly empty custom tool list remains empty", async (t) => {
+    const f = await fixture(t);
+    mkdirSync(join(f.root, "agents"));
+    writeFileSync(join(f.root, "agents", "no-tools.md"), "---\ntools: []\n---\nAnswer without tools.");
+    const [record] = await f.start([{ task: "answer", agent: "no-tools" }]);
+    await until(() => record.finished);
+    assert.deepEqual(Array.from(f.children[0].selectedTools), []);
+});
+
+test("an explicit model on resume persists to the next resume", async (t) => {
+    const f = await fixture(t);
+    const [first] = await f.start([{ task: "first", model: "test/original:low" }]);
+    await until(() => first.finished);
+    const second = await f.manager.resume(f.ctx, first.id, "second", "test/selected:high");
+    await until(() => second.finished);
+    const third = await f.manager.resume(f.ctx, first.id, "third");
+    await until(() => third.finished);
+    assert.equal(f.children[2].model.id, "selected");
+    assert.equal(f.children[2].thinkingLevel, "high");
+});
+
+test("model switches during extension startup survive lazy session-file creation", async (t) => {
+    const f = await fixture(t, { deferSessionFile: true });
+    const bindGate = deferred();
+    f.behaviors.push({ bindGate });
+    const [record] = await f.start([{ task: "first", model: "test/original:low" }]);
+    await until(() => f.children.length === 1 && record.descendants);
+    assert.equal(existsSync(record.sessionFile), false);
+    await f.manager.switchOnly(f.ctx, record.id, "test/selected:high");
+    bindGate.resolve();
+    await until(() => record.finished);
+    const next = await f.manager.resume(f.ctx, record.id, "continue");
+    await until(() => next.finished);
+    assert.equal(f.children[1].model.id, "selected");
+    assert.equal(f.children[1].thinkingLevel, "high");
+});
+
+test("the last force-stopped descendant settling wakes its parked parent", async (t) => {
+    const f = await fixture(t, { maxConcurrent: 2 });
+    const gate = deferred();
+    f.behaviors.push({ async run(child) {
+        if (child.turns === 1) await child.callTool("task", { context: "nested", tasks: [{ task: "leaf" }] });
+    } }, { gate });
+    const [record] = await f.start([{ task: "parent" }]);
+    await until(() => record.parked && f.children.length === 2);
+    const descendant = f.manager.treeRows(f.ctx)[1].record;
+    f.manager.stop(descendant.id);
+    f.stopTimers[0].callback();
+    await until(() => f.children[0].turns === 2 && record.parked);
+    gate.resolve();
+    await until(() => record.finished);
+    assert.equal(record.status, "completed", record.error);
+    assert.equal((await f.manager.wait()).id, record.id);
+    assert.equal(f.manager.tree.active, 0);
+});
+
+test("a queued child stopped before startup reports no saved session rather than nested ownership", async (t) => {
+    const f = await fixture(t, { maxConcurrent: 1 });
+    const gate = deferred();
+    f.behaviors.push({ gate });
+    const records = await f.start([{ task: "running" }, { task: "queued" }]);
+    await until(() => f.children.length === 1);
+    f.manager.stop(records[1].id);
+    await assert.rejects(f.manager.resume(f.ctx, records[1].id, "continue"), /has no saved session to resume/);
+    gate.resolve();
+    await until(() => records[0].finished);
+});
+
+test("cyclic journal parent links are ignored without rewriting or hanging", async (t) => {
+    const f = await fixture(t);
+    const [record] = await f.start([{ task: "inspect" }]);
+    await until(() => record.finished);
+    const entries = readFileSync(record.sessionFile, "utf8").trim().split("\n").map(JSON.parse);
+    entries[1].parentId = entries[1].id;
+    const content = entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n";
+    writeFileSync(record.sessionFile, content);
+    const restored = new f.exports.SubagentManager({ sendMessage() {} });
+    assert.equal((await restored.listAll(f.ctx)).length, 0);
+    assert.equal(readFileSync(record.sessionFile, "utf8"), content);
+    restored.shutdown();
+});
+
+test("saved model selection follows the active branch rather than the latest physical line", async (t) => {
+    const f = await fixture(t);
+    const [record] = await f.start([{ task: "inspect", model: "test/original" }]);
+    await until(() => record.finished);
+    const entries = readFileSync(record.sessionFile, "utf8").trim().split("\n").map(JSON.parse);
+    entries.push(
+        { type: "custom", id: "chosen", parentId: entries[1].id, customType: "omp-subagent-model", data: { model: "test/chosen:high", thinking: "high" } },
+        { type: "custom", id: "other", parentId: entries[1].id, customType: "omp-subagent-model", data: { model: "test/other:low", thinking: "low" } },
+        { type: "message", id: "leaf", parentId: "chosen", message: { role: "assistant", content: [{ type: "text", text: "chosen branch" }] } },
+    );
+    writeFileSync(record.sessionFile, entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n");
+    const restored = new f.exports.SubagentManager({ sendMessage() {} });
+    const [saved] = await restored.listAll(f.ctx);
+    assert.equal(saved.modelSpec, "test/chosen:high");
+    assert.equal(saved.thinking, "high");
+    restored.shutdown();
+});
+
+test("orphan cleanup does not remove the current tree when its parent file moves", async (t) => {
+    const f = await fixture(t);
+    const gate = deferred();
+    f.behaviors.push({ gate });
+    const [record] = await f.start([{ task: "inspect" }]);
+    await until(() => f.children.length === 1 && f.children[0].promptText);
+    rmSync(f.ctx.sessionManager.getSessionFile());
+    await f.manager.listAll(f.ctx);
+    assert.equal(existsSync(record.sessionFile), true);
+    gate.resolve();
+    await until(() => record.finished);
+    await f.manager.getAny(f.ctx, record.id);
+    assert.equal(existsSync(record.sessionFile), true);
+});
+
+test("extension load and runtime failures are reported as deduplicated warnings", async (t) => {
+    const f = await fixture(t, { extensionLoadError: "could not load optional extension" });
+    f.behaviors.push({ extensionError: "optional startup hook failed" });
+    const [record] = await f.start([{ task: "inspect" }]);
+    await until(() => record.finished);
+    const report = await f.manager.wait();
+    assert.equal(report.status, "completed");
+    assert.equal(report.text, "answer");
+    assert.equal(report.warnings.length, 2);
+    assert.ok(report.warnings.some((warning) => warning.includes("could not load")));
+    assert.ok(report.warnings.some((warning) => warning.includes("startup hook failed")));
+    assert.ok(f.exports.formatResult(report).includes("<warnings>"));
+});
+
+test("custom prototype-like role names are stored as own definitions", async (t) => {
+    const f = await fixture(t);
+    mkdirSync(join(f.root, "agents"));
+    writeFileSync(join(f.root, "agents", "__proto__.md"), "Custom prototype-named role.");
+    const agents = f.exports.loadAgents(f.ctx);
+    assert.equal(Object.getPrototypeOf(agents), null);
+    assert.equal(Object.hasOwn(agents, "__proto__"), true);
+    assert.equal(f.exports.resolveAgent(agents, "__proto__").prompt, "Custom prototype-named role.");
+});
+
+test("a model switch while createAgentSession is pending applies before the first prompt", async (t) => {
+    const f = await fixture(t, { deferSessionFile: true });
+    const creationGate = deferred();
+    f.behaviors.push({ creationGate });
+    const [record] = await f.start([{ task: "inspect", model: "test/original:low" }]);
+    await until(() => f.children.length === 1);
+    assert.equal(record.child, undefined);
+    await f.manager.switchOnly(f.ctx, record.id, "test/selected:high");
+    creationGate.resolve();
+    await until(() => record.finished);
+    assert.equal(f.children[0].model.id, "selected");
+    assert.equal(f.children[0].thinkingLevel, "high");
+});
+
+test("concurrent model switches keep live state and persisted selection consistent", async (t) => {
+    const f = await fixture(t);
+    const promptGate = deferred();
+    const setterGate = deferred();
+    f.behaviors.push({ gate: promptGate, setterGate });
+    const [record] = await f.start([{ task: "inspect", model: "test/original" }]);
+    await until(() => f.children.length === 1 && f.children[0].promptText);
+    const child = f.children[0];
+    child.setModel = async (model) => { child.model = model; if (model.id === "first") await setterGate.promise; };
+    const first = f.manager.switchOnly(f.ctx, record.id, "test/first");
+    await until(() => child.model.id === "first");
+    const second = f.manager.switchOnly(f.ctx, record.id, "test/second");
+    await delay(5);
+    setterGate.resolve();
+    await Promise.all([first, second]);
+    assert.equal(child.model.id, "second");
+    assert.equal(record.modelSpec, "test/second");
+    promptGate.resolve();
+    await until(() => record.finished);
+    const restored = new f.exports.SubagentManager({ sendMessage() {} });
+    assert.equal((await restored.listAll(f.ctx))[0].modelSpec, "test/second");
+    restored.shutdown();
+});
+
+test("a queued thinking-only update uses the preceding model selection", async (t) => {
+    const f = await fixture(t);
+    const promptGate = deferred();
+    const setterGate = deferred();
+    f.behaviors.push({ gate: promptGate, setterGate });
+    const [record] = await f.start([{ task: "inspect", model: "test/original" }]);
+    await until(() => f.children.length === 1 && f.children[0].promptText);
+    const child = f.children[0];
+    child.setModel = async (model) => { child.model = model; await setterGate.promise; };
+    const modelUpdate = f.manager.switchOnly(f.ctx, record.id, "test/selected:low");
+    await until(() => child.model.id === "selected");
+    const thinkingUpdate = f.manager.switchOnly(f.ctx, record.id, undefined, "high");
+    setterGate.resolve();
+    await Promise.all([modelUpdate, thinkingUpdate]);
+    assert.equal(record.modelSpec, "test/selected:low");
+    assert.equal(child.model.id, "selected");
+    assert.equal(child.thinkingLevel, "high");
+    promptGate.resolve();
+    await until(() => record.finished);
+});
+
+test("a failed model update does not poison the next queued update", async (t) => {
+    const f = await fixture(t);
+    const promptGate = deferred();
+    f.behaviors.push({ gate: promptGate });
+    const [record] = await f.start([{ task: "inspect" }]);
+    await until(() => f.children.length === 1 && f.children[0].promptText);
+    const child = f.children[0];
+    child.setModel = async (model) => { if (model.id === "bad") throw new Error("mock authentication failed"); child.model = model; };
+    const bad = f.manager.switchOnly(f.ctx, record.id, "test/bad");
+    const good = f.manager.switchOnly(f.ctx, record.id, "test/good");
+    await Promise.all([assert.rejects(bad, /mock authentication failed/), good]);
+    assert.equal(record.modelSpec, "test/good");
+    assert.equal(child.model.id, "good");
+    promptGate.resolve();
+    await until(() => record.finished);
+});
+
+test("session cleanup and resume wait for an in-flight model update", async (t) => {
+    const f = await fixture(t);
+    const promptGate = deferred();
+    const setterGate = deferred();
+    f.behaviors.push({ gate: promptGate, setterGate });
+    const [record] = await f.start([{ task: "inspect" }]);
+    await until(() => f.children.length === 1 && f.children[0].promptText);
+    const child = f.children[0];
+    child.setModel = async (model) => { child.model = model; await setterGate.promise; };
+    const update = f.manager.switchOnly(f.ctx, record.id, "test/selected");
+    await until(() => child.model.id === "selected");
+    promptGate.resolve();
+    await delay(5);
+    assert.equal(record.finished, false);
+    assert.equal(child.disposed, undefined);
+    await assert.rejects(f.manager.resume(f.ctx, record.id, "too early"), /still running or stopping/);
+    setterGate.resolve();
+    await update;
+    await until(() => record.finished);
+    assert.equal(f.manager.tree.active, 0);
+});
+
+test("explicit search-tool selections do not silently grant bash access", async (t) => {
+    const f = await fixture(t);
+    mkdirSync(join(f.root, "agents"));
+    writeFileSync(join(f.root, "agents", "search-only.md"), "---\ntools: read, grep, find, web_search, grep\n---\nSearch only.");
+    const [record] = await f.start([{ task: "inspect", agent: "search-only" }]);
+    await until(() => record.finished);
+    assert.deepEqual(Array.from(f.children[0].selectedTools), ["read", "grep", "find", "web_search"]);
 });
 
 test("custom agent frontmatter supports Windows line endings", async (t) => {
