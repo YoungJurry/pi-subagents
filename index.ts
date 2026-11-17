@@ -335,7 +335,7 @@ function loadAgents(ctx: ExtensionContext): Record<string, AgentDefinition> {
 
 function resolveAgent(agents: Record<string, AgentDefinition>, name: string | undefined): AgentDefinition {
 	const key = name?.trim() || "task";
-	const agent = agents[key] ?? (key === "worker" || key === "general" ? agents.task : undefined);
+	const agent = agents[key] ?? (key === "worker" ? agents.task : undefined);
 	if (!agent) {
 		throw new Error(`Unknown agent: ${key}. Available: ${Object.keys(agents).sort().join(", ")}`);
 	}

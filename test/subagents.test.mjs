@@ -506,11 +506,11 @@ test("empty assistant output is failed, not a success-shaped placeholder", async
     assert.equal((await f.manager.wait()).status, "failed");
 });
 
-test("global default model is used for built-in roles and legacy aliases", async (t) => {
+test("global default model is used for built-in roles and the worker alias", async (t) => {
     const f = await fixture(t, { config: { defaultModel: "test/flash" } });
-    const records = await f.start(["task", "scout", "review", "general", "worker"].map((agent) => ({ task: "report", agent })));
+    const records = await f.start(["task", "scout", "review", "worker"].map((agent) => ({ task: "report", agent })));
     await until(() => records.every((record) => record.finished));
-    assert.equal(f.children.length, 5);
+    assert.equal(f.children.length, 4);
     for (const child of f.children) assert.equal(child.model.id, "flash");
     for (const record of records) {
         assert.equal(record.modelSpec, "test/flash");
@@ -664,13 +664,23 @@ test("colored labels keep the resolved runtime model and saved-session fallback"
     assert.ok(f.exports.agentListLabel(saved, theme).endsWith("inherit:inherit"));
 });
 
-test("only three built-in roles remain; general and worker are compatibility aliases", async (t) => {
+test("only three built-in roles remain; worker is the task alias", async (t) => {
     const f = await fixture(t);
     const agents = f.exports.loadAgents(f.ctx);
     assert.deepEqual(Object.keys(agents).sort(), ["review", "scout", "task"]);
-    for (const name of [undefined, "task", "general", "worker"]) {
+    for (const name of [undefined, "task", "worker"]) {
         assert.equal(f.exports.resolveAgent(agents, name).name, "task");
     }
+});
+
+test("general is not exposed in tool contracts and fails batch preflight as an unknown role", async (t) => {
+    const f = await fixture(t);
+    for (const { description, promptSnippet, parameters } of f.tools) {
+        assert.doesNotMatch(JSON.stringify({ description, promptSnippet, parameters }), /\bgeneral\b/i);
+    }
+    await assert.rejects(f.start([{ task: "valid", agent: "task" }, { task: "removed", agent: "general" }]), /Unknown agent: general/);
+    assert.equal(f.manager.list().length, 0);
+    assert.equal(f.children.length, 0);
 });
 
 test("approved role prompts use only the single shared introduction", async (t) => {
@@ -706,18 +716,18 @@ test("all roles load configured extensions and builtins without a tool allowlist
     }
 });
 
-test("custom general overrides the legacy alias and retains its own prompt and tool selection", async (t) => {
+test("custom worker overrides the alias and retains its own prompt and tool selection", async (t) => {
     const f = await fixture(t);
     mkdirSync(join(f.root, "agents"));
-    writeFileSync(join(f.root, "agents", "general.md"), "---\ntools: read, web_search, fetch\n---\nMy custom instructions.");
-    const [record] = await f.start([{ agent: "general", task: "inspect" }]);
+    writeFileSync(join(f.root, "agents", "worker.md"), "---\ntools: read, web_search, fetch\n---\nMy custom instructions.");
+    const [record] = await f.start([{ agent: "worker", task: "inspect" }]);
     await until(() => record.finished);
-    assert.equal(record.agent, "general");
+    assert.equal(record.agent, "worker");
     assert.equal(f.children[0].resourceOptions.systemPrompt, "My custom instructions.");
     assert.deepEqual(Array.from(f.children[0].selectedTools), ["read", "web_search", "fetch"]);
 });
 
-test("a legacy saved general child resumes through the task compatibility alias", async (t) => {
+test("saved general children are not silently resumed as task", async (t) => {
     const f = await fixture(t);
     const [first] = await f.start([{ task: "first" }]);
     await until(() => first.finished);
@@ -725,10 +735,8 @@ test("a legacy saved general child resumes through the task compatibility alias"
     const entries = readFileSync(first.sessionFile, "utf8").trim().split("\n").map(JSON.parse);
     for (const entry of entries) if (entry.customType === "omp-subagent") entry.data.agent = "general";
     writeFileSync(first.sessionFile, entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n");
-    const resumed = await f.manager.resume(f.ctx, first.id, "continue");
-    await until(() => resumed.finished);
-    assert.equal(resumed.status, "completed");
-    assert.equal(f.children[1].resourceOptions.systemPrompt, f.exports.loadAgents(f.ctx).task.prompt);
+    await assert.rejects(f.manager.resume(f.ctx, first.id, "continue"), /Unknown agent: general/);
+    assert.equal(f.children.length, 1);
 });
 
 test("nested waits lend slots and permit more than two levels with a budget of one", async (t) => {
