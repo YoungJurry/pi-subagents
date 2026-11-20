@@ -296,18 +296,21 @@ test("tool schemas/descriptions stay byte-identical; only the original two hooks
     assert.deepEqual(f.tools.map((tool) => tool.name), ["task", "wait", "agent"]);
 });
 
-test("queue clearing cannot discard the report, and wait recovers an unacknowledged handoff", async (t) => {
+test("wait after handoff returns no duplicate, even if the wake-up was cleared", async (t) => {
     const f = await fixture(t);
-    const [record] = await f.start([{ task: "report" }]);
-    await until(() => record.finished);
-    await delay(80);
-    assert.equal(f.durable.length, 1);
+    const task = f.tools.find((tool) => tool.name === "task");
+    const wait = f.tools.find((tool) => tool.name === "wait");
+    await task.execute("task-call", { context: "shared", tasks: [{ task: "report" }] }, undefined, undefined, f.ctx);
+    await until(() => f.durable.length === 1);
     assert.equal(f.wakeups.length, 1);
     f.clearQueue(); // Mirrors Pi's clearQueue: follow-ups go, context-only messages remain.
-    assert.equal((await f.manager.wait()).text, "answer");
+    const waiting = await wait.execute("wait-call", {}, undefined, undefined, f.ctx);
+    assert.equal(waiting.content[0].text, "Completed subagent results are queued for automatic delivery.");
     f.boundary();
+    assert.equal(f.parentEntries.length, 1);
     assert.match(f.parentEntries[0].content, /answer/);
-    assert.equal(await f.manager.wait(), undefined);
+    const done = await wait.execute("next-wait", {}, undefined, undefined, f.ctx);
+    assert.equal(done.content[0].text, "No running subagents.");
 });
 
 test("persisted reports are acknowledged and are not returned twice", async (t) => {
@@ -353,7 +356,22 @@ test("separate runs of the same child have distinct delivery acknowledgements", 
     await until(() => second.finished);
     await delay(80);
     assert.notEqual(f.durable[0].details.deliveryId, firstId);
-    assert.equal((await f.manager.wait()).text, "answer");
+    f.boundary();
+    assert.equal(await f.manager.wait(), undefined);
+});
+
+test("wait takes an available result past an earlier automatic handoff", async (t) => {
+    const f = await fixture(t);
+    const gate = deferred();
+    f.behaviors.push({ text: "already queued" }, { gate, text: "available to wait" });
+    const [, second] = await f.start([{ task: "first" }, { task: "second" }]);
+    await until(() => f.durable.length === 1);
+    gate.resolve();
+    await until(() => second.finished);
+    assert.equal((await f.manager.wait()).text, "available to wait");
+    await delay(80);
+    assert.equal(f.durable.length, 1);
+    assert.match(f.durable[0].content, /already queued/);
 });
 
 test("more waiters than results all settle, without duplicate deliveries", async (t) => {

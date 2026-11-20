@@ -151,6 +151,8 @@ interface TaskResult {
 	warnings?: string[];
 }
 
+type WaitResult = TaskResult | "auto-delivery" | undefined;
+
 interface SavedTask {
 	id: string;
 	name: string;
@@ -1604,8 +1606,8 @@ class SubagentManager {
 	}
 
 	private pruneDelivered(): void {
-		// A handed-off notification is not an acknowledgement. Keep the mailbox until
-		// the report is actually in the parent transcript, or wait() consumes it.
+		// Keep handed-off results until Pi records them. While in flight, automatic
+		// delivery owns these results and wait() must leave them alone.
 		if (this.pending.length === 0) return;
 		const acknowledged = new Set<string>();
 		for (const entry of this.context?.sessionManager.getBranch() ?? []) {
@@ -1639,15 +1641,16 @@ class SubagentManager {
 			this.pruneDelivered();
 			const results = this.pending.filter((result) => !this.sent.has(result.deliveryId));
 			if (results.length === 0) return this.revision;
+			for (const result of results) this.sent.add(result.deliveryId);
 			this.childFlush = (async () => {
 				try {
 					await this.host!.child.sendCustomMessage({
 						customType: "subagent-result", content: results.map(formatResult).join("\n"),
 						display: true, details: results.length === 1 ? results[0] : { results },
 					}, { triggerTurn: false });
-					for (const result of results) this.sent.add(result.deliveryId);
 					return true;
 				} catch {
+					for (const result of results) this.sent.delete(result.deliveryId);
 					return false;
 				}
 			})().finally(() => { this.childFlush = undefined; });
@@ -1684,26 +1687,28 @@ class SubagentManager {
 				{ deliverAs: "followUp", triggerTurn: true },
 			);
 		} catch {
-			// Keep unacknowledged reports recoverable through wait() after a failed send.
+			// Any reports that Pi did not accept remain available to wait().
 		}
 	}
 
-	async wait(signal?: AbortSignal): Promise<TaskResult | undefined> {
+	async wait(signal?: AbortSignal): Promise<WaitResult> {
 		return this.suspended(() => this.waitResult(signal));
 	}
 
-	private async waitResult(signal?: AbortSignal): Promise<TaskResult | undefined> {
+	private async waitResult(signal?: AbortSignal): Promise<WaitResult> {
 		if (this.closed) throw new Error("Session closed");
 		if (signal?.aborted) throw new Error("aborted");
 		this.pruneDelivered();
 		if (this.pending.length === 0) this.needsTurn = false;
-		if (this.pending.length > 0) {
-			const result = this.pending.shift()!;
-			this.sent.delete(result.deliveryId);
+		const available = this.pending.findIndex((result) => !this.sent.has(result.deliveryId));
+		if (available !== -1) {
+			const [result] = this.pending.splice(available, 1);
 			if (this.pending.length === 0) this.needsTurn = false;
 			this.scheduleFlush();
 			return result;
 		}
+		// Finishing this tool call lets Pi append reports deferred to the turn boundary.
+		if (this.pending.length > 0) return "auto-delivery";
 		if (!this.hasActive()) return undefined;
 		return await new Promise<TaskResult | undefined>((resolve, reject) => {
 			const waiter: Waiter = { resolve, reject };
@@ -2065,6 +2070,9 @@ export default function subagents(pi: ExtensionAPI, tree?: TaskTree, host?: Task
 		async execute(_toolCallId, _params, signal, _onUpdate, ctx) {
 			const mgr = getManager(ctx);
 			const result = await mgr.wait(signal);
+			if (result === "auto-delivery") {
+				return { content: [{ type: "text", text: "Completed subagent results are queued for automatic delivery." }], details: {} };
+			}
 			if (!result) {
 				return { content: [{ type: "text", text: "No running subagents." }], details: {} };
 			}

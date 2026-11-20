@@ -111,12 +111,13 @@ No environment variables are used. Reload/restart after changing the file.
   children. Use `wait` when blocked instead of polling.
 - Reports are saved in the parent transcript independently of the best-effort
   follow-up that wakes the parent. Clearing Pi's message queue cannot discard
-  a report; `wait` can recover a handoff that is not yet acknowledged.
+  a report. If sending a report fails, it remains available through `wait`.
 
 ### `wait`
 
-No parameters. Returns the first settled result, or immediately when nothing is
-running.
+No parameters. Returns the first settled result available to `wait`, or immediately
+when nothing is running. If completed results are already queued for automatic
+delivery, `wait` can return a short notice so Pi can append them at the end of the turn.
 
 ### `agent`
 
